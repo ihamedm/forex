@@ -4,10 +4,10 @@
 //+------------------------------------------------------------------+
 #property copyright "Hamed Movasaqpoor"
 #property link      "hamed.movasaqpoor@gmail.com"
-#property version   "6.13"
+#property version   "6.19"
 
 #include <Trade\Trade.mqh>
-const string EA_VERSION = "6.13";
+const string EA_VERSION = "6.19";
 
 //------------------------- CAMARILLA RANGE MODES -------------------------
 enum CamarillaRangeMode {
@@ -21,6 +21,7 @@ enum CamarillaRangeMode {
 input group "=== تنظیمات کلی ==="
 input int    MagicNumber       = 202701;   // شماره جادویی
 input int    TesterStartHour      = 1;        // ساعت شروع شبکه در تستر (0-23)
+input bool   EnableDebugLog    = false;     // چاپ لاگ‌های جزئی (دیباگ)
 
 
 input group "=== تشخیص روند ==="
@@ -61,6 +62,16 @@ input double ExpansionMinDistanceFactor = 0.8;   // حداقل فاصله از �
 input int    ExpansionMethod       = 1;        //متد گسترش : 0 = فعال‌شدن سفارش | 1 = تغییر قیمت
 
 
+input group "=== شبکه‌های متوالی ==="
+input bool   EnableConsecutiveGrids = false;   // شروع خودکار شبکه جدید پس از پایان شبکه قبلی
+input int    ConsecutiveGridDelaySec = 60;     // تاخیر بین پایان شبکه و شروع شبکه بعدی (ثانیه)
+
+
+input group "=== نمایش دکمه‌ها ==="
+input bool   ShowCamarillaButtons = false;      // نمایش دکمه‌های حمایت/مقاومت، حالت بازه و Range
+input bool   ShowStartTimerButton = false;      // نمایش دکمه تایمر شروع
+
+
 input group "=== تریلینگ سبد ==="
 input bool   UseBasketTrailing   = false;      // فعال‌سازی تریلینگ حد ضرر کل شبکه
 input double TrailingActivation  = 5.0;       // سود اولیه برای شروع تریلینگ (دلار)
@@ -81,6 +92,7 @@ bool   g_EnableCamarillaRangeCheck = true; // محدود کردن سفارشات
 CamarillaRangeMode g_CamarillaRange = MODE_H2_L2; // متغیر قابل تغییر برای حالت بازه
 double g_TrailingActivation = 5.0; // مقدار فعال‌سازی تریلینگ قابل تغییر
 bool   g_EnableStartTimer = false; // وضعیت تایمر شروع شبکه
+bool   g_EnableConsecutiveGrids = false; // وضعیت شبکه‌های متوالی (قابل تغییر با دکمه)
 datetime g_LastTimerTriggeredDate = 0; // آخرین تاریخ/زمان اجرای تایمر
 CTrade GridTrade;
 bool   g_WaitingForMarketOpen = false;
@@ -99,6 +111,16 @@ double lastBuyExpansionPrice  = 0;   // نقطه‌ی مرجع برای گستر
 double lastSellExpansionPrice = 0;   // نقطه‌ی مرجع برای گسترش فروش
 
 double g_ActualGridStep  = 0;
+
+datetime g_NextGridStartTime = 0;   // زمان شروع خودکار شبکه بعدی (0 = زمان‌بندی فعال نیست)
+
+// --- آمار زنجیره شبکه‌های متوالی ---
+bool     g_SessionStarted     = false;  // آیا زنجیره‌ای برای نمایش وجود دارد؟
+bool     g_SessionActive      = false;  // آیا شبکه‌های جدید به زنجیره اضافه می‌شوند؟
+int      g_SessionStartMagic  = 0;      // Magic اولین شبکه زنجیره
+datetime g_SessionStartTime   = 0;      // زمان شروع زنجیره
+int      g_SessionGridCount   = 0;      // تعداد شبکه‌های باز شده در زنجیره
+int      g_SessionClosedCount = 0;      // تعداد شبکه‌های بسته شده در زنجیره
 
 int    g_ActiveMagic = 0;        // MagicNumber پویا برای شبکه‌ی جاری
 int    g_GridInstance = 0;       // شمارنده‌ی شبکه (برای تولید Magic یکتا)
@@ -180,7 +202,15 @@ void SaveState()
    GlobalVariableSet(GVarName("g_MinFloatingPL"), g_MinFloatingPL);
    GlobalVariableSet(GVarName("g_MaxFloatingPL"), g_MaxFloatingPL);
    GlobalVariableSet(GVarName("g_FloatingExtremesInited"), g_FloatingExtremesInited ? 1.0 : 0.0);
-   Print("📌 EA state saved to GlobalVariables.");
+   GlobalVariableSet(GVarName("g_NextGridStartTime"), (double)g_NextGridStartTime);
+   GlobalVariableSet(GVarName("g_EnableConsecutiveGrids"), g_EnableConsecutiveGrids ? 1.0 : 0.0);
+   GlobalVariableSet(GVarName("g_SessionStarted"), g_SessionStarted ? 1.0 : 0.0);
+   GlobalVariableSet(GVarName("g_SessionActive"), g_SessionActive ? 1.0 : 0.0);
+   GlobalVariableSet(GVarName("g_SessionStartMagic"), (double)g_SessionStartMagic);
+   GlobalVariableSet(GVarName("g_SessionStartTime"), (double)g_SessionStartTime);
+   GlobalVariableSet(GVarName("g_SessionGridCount"), (double)g_SessionGridCount);
+   GlobalVariableSet(GVarName("g_SessionClosedCount"), (double)g_SessionClosedCount);
+   if(EnableDebugLog) Print("📌 EA state saved to GlobalVariables.");
   }
 
 bool LoadState()
@@ -229,24 +259,45 @@ bool LoadState()
                      ? GlobalVariableGet(GVarName("g_MinFloatingPL")) : 0.0;
   g_MaxFloatingPL = GlobalVariableCheck(GVarName("g_MaxFloatingPL"))
                      ? GlobalVariableGet(GVarName("g_MaxFloatingPL")) : 0.0;
-  g_FloatingExtremesInited = GlobalVariableCheck(GVarName("g_FloatingExtremesInited"))
+   g_FloatingExtremesInited = GlobalVariableCheck(GVarName("g_FloatingExtremesInited"))
                               ? (GlobalVariableGet(GVarName("g_FloatingExtremesInited")) >= 0.5) : false;
+
+   g_NextGridStartTime = GlobalVariableCheck(GVarName("g_NextGridStartTime"))
+                         ? (datetime)GlobalVariableGet(GVarName("g_NextGridStartTime")) : 0;
+
+   g_EnableConsecutiveGrids = GlobalVariableCheck(GVarName("g_EnableConsecutiveGrids"))
+                              ? (GlobalVariableGet(GVarName("g_EnableConsecutiveGrids")) >= 0.5)
+                              : EnableConsecutiveGrids;
+
+   g_SessionStarted     = GlobalVariableCheck(GVarName("g_SessionStarted"))
+                          ? (GlobalVariableGet(GVarName("g_SessionStarted")) >= 0.5) : false;
+   g_SessionActive      = GlobalVariableCheck(GVarName("g_SessionActive"))
+                          ? (GlobalVariableGet(GVarName("g_SessionActive")) >= 0.5) : false;
+   g_SessionStartMagic  = GlobalVariableCheck(GVarName("g_SessionStartMagic"))
+                          ? (int)GlobalVariableGet(GVarName("g_SessionStartMagic")) : 0;
+   g_SessionStartTime   = GlobalVariableCheck(GVarName("g_SessionStartTime"))
+                          ? (datetime)GlobalVariableGet(GVarName("g_SessionStartTime")) : 0;
+   g_SessionGridCount   = GlobalVariableCheck(GVarName("g_SessionGridCount"))
+                          ? (int)GlobalVariableGet(GVarName("g_SessionGridCount")) : 0;
+   g_SessionClosedCount = GlobalVariableCheck(GVarName("g_SessionClosedCount"))
+                          ? (int)GlobalVariableGet(GVarName("g_SessionClosedCount")) : 0;
+
 
 
    g_CurrentLot = NormalizeLotVolume(g_CurrentLot);
 
    g_GridID = "شبکه " + IntegerToString(g_GridInstance + 1);
 
-   Print("📌 EA state loaded from GlobalVariables.");
+   if(EnableDebugLog) Print("📌 EA state loaded from GlobalVariables.");
    return true;
   }
 
 void ClearState()
   {
    string prefix = "GridHedge~" + _Symbol + "~" + IntegerToString(MagicNumber) + "~";
-   string names[] = {"inited","g_GridInstance","g_ActiveMagic","isTradingActive","tradingDone","buyExpansionCount","sellExpansionCount","lastBuyPosCount","lastSellPosCount","lastBuyExpansionPrice","lastSellExpansionPrice","g_MaxBuyExpansions","g_MaxSellExpansions","g_ActualGridStep","g_CurrentLot","g_OrderCommentSeq","EnableCamarillaCheck","EnableCamarillaRangeCheck","g_CamarillaRange","TrailingActivation","EnableStartTimer","g_LastTimerTriggeredDate","g_SymmetricMode", "g_MinFloatingPL","g_MaxFloatingPL","g_FloatingExtremesInited"};
+   string names[] = {"inited","g_GridInstance","g_ActiveMagic","isTradingActive","tradingDone","buyExpansionCount","sellExpansionCount","lastBuyPosCount","lastSellPosCount","lastBuyExpansionPrice","lastSellExpansionPrice","g_MaxBuyExpansions","g_MaxSellExpansions","g_ActualGridStep","g_CurrentLot","g_OrderCommentSeq","EnableCamarillaCheck","EnableCamarillaRangeCheck","g_CamarillaRange","TrailingActivation","EnableStartTimer","g_LastTimerTriggeredDate","g_SymmetricMode", "g_MinFloatingPL","g_MaxFloatingPL","g_FloatingExtremesInited","g_NextGridStartTime","g_EnableConsecutiveGrids","g_SessionStarted","g_SessionActive","g_SessionStartMagic","g_SessionStartTime","g_SessionGridCount","g_SessionClosedCount"};
    for(int i=0;i<ArraySize(names);i++) GlobalVariableDel(prefix + names[i]);
-   Print("📌 Cleared persisted EA state.");
+   if(EnableDebugLog) Print("📌 Cleared persisted EA state.");
   }
 
 void PrepareGridCommentContext()
@@ -272,15 +323,15 @@ void PrintSymbolInfo()
   {
    double pointVal = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE) /
                      SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE) * _Point;
-   PrintFormat("══ اطلاعات نماد: %s ══", _Symbol);
-   PrintFormat("  _Point       = %.8f", _Point);
-   PrintFormat("  Digits       = %d",   (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS));
-   PrintFormat("  TickSize     = %.8f", SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE));
-   PrintFormat("  TickValue    = %.5f", SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE));
-   PrintFormat("  ارزش هر Point برای ۱ لات = %.5f $", pointVal);
-   PrintFormat("  GridStep     = %.5f $ (%.0f Point)", GridStep_Points * _Point, GridStep_Points);
-   PrintFormat("  SL فاصله    = %.5f $ (%.0f Point)", SL_Points * _Point, SL_Points);
-   PrintFormat("  TP فاصله    = %.5f $ (%.0f Point)", TP_Points * _Point, TP_Points);
+   if(EnableDebugLog) PrintFormat("══ اطلاعات نماد: %s ══", _Symbol);
+   if(EnableDebugLog) PrintFormat("  _Point       = %.8f", _Point);
+   if(EnableDebugLog) PrintFormat("  Digits       = %d",   (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS));
+   if(EnableDebugLog) PrintFormat("  TickSize     = %.8f", SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE));
+   if(EnableDebugLog) PrintFormat("  TickValue    = %.5f", SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE));
+   if(EnableDebugLog) PrintFormat("  ارزش هر Point برای ۱ لات = %.5f $", pointVal);
+   if(EnableDebugLog) PrintFormat("  GridStep     = %.5f $ (%.0f Point)", GridStep_Points * _Point, GridStep_Points);
+   if(EnableDebugLog) PrintFormat("  SL فاصله    = %.5f $ (%.0f Point)", SL_Points * _Point, SL_Points);
+   if(EnableDebugLog) PrintFormat("  TP فاصله    = %.5f $ (%.0f Point)", TP_Points * _Point, TP_Points);
   }
 
 double GetLotStep()
@@ -340,9 +391,9 @@ void InitLotStepArrays()
    bool sellParsed = ParseLotSteps(SellLotSteps, g_SellLots);
 
    if(buyParsed)
-      PrintFormat("📦 حجم پله‌های خرید: %d مقدار (آخرین=%.3f)", ArraySize(g_BuyLots), g_BuyLots[ArraySize(g_BuyLots)-1]);
+      if(EnableDebugLog) PrintFormat("📦 حجم پله‌های خرید: %d مقدار (آخرین=%.3f)", ArraySize(g_BuyLots), g_BuyLots[ArraySize(g_BuyLots)-1]);
    if(sellParsed)
-      PrintFormat("📦 حجم پله‌های فروش: %d مقدار (آخرین=%.3f)", ArraySize(g_SellLots), g_SellLots[ArraySize(g_SellLots)-1]);
+      if(EnableDebugLog) PrintFormat("📦 حجم پله‌های فروش: %d مقدار (آخرین=%.3f)", ArraySize(g_SellLots), g_SellLots[ArraySize(g_SellLots)-1]);
   }
 
 bool HasVariableBuyLots()
@@ -524,7 +575,7 @@ void SyncPositionProtectionToOpenPrice(ulong positionTicket)
       return;
 
    if(ModifyPositionProtection(ticket, sl, tp))
-      PrintFormat("✅ TP/SL بر اساس قیمت ورود واقعی اصلاح شد | ticket=%I64u open=%.5f SL=%.5f TP=%.5f",
+      if(EnableDebugLog) PrintFormat("✅ TP/SL بر اساس قیمت ورود واقعی اصلاح شد | ticket=%I64u open=%.5f SL=%.5f TP=%.5f",
                   ticket, openPrice, sl, tp);
   }
 
@@ -560,8 +611,9 @@ int OnInit()
       g_EnableCamarillaRangeCheck = EnableCamarillaRangeCheck;
       g_CamarillaRange = CamarillaRange;
       g_TrailingActivation = TrailingActivation;
-      g_EnableStartTimer = EnableStartTimer;
-      g_LastTimerTriggeredDate = 0;
+       g_EnableStartTimer = EnableStartTimer;
+       g_EnableConsecutiveGrids = EnableConsecutiveGrids;
+       g_LastTimerTriggeredDate = 0;
     }
 
    InitLotStepArrays();
@@ -577,8 +629,9 @@ int OnInit()
       CreateCloseButtons();        // «بستن سودده»، «بستن همه»، «پایان شبکه»
       CreateExpansionButtons();    // دکمه‌های ± خرید و فروش
       CreateLotButtons();
-      CreateStartButton();         // «شروع شبکه»
-      UpdateStartTimerLabel();
+       CreateStartButton();         // «شروع شبکه»
+       UpdateStartTimerLabel();
+       CreateConsecutiveGridsButton(); // دکمه فعال/غیرفعال شبکه‌های متوالی
 
       bool gridExists = AnyGridExists();
       if(gridExists && !tradingDone)
@@ -638,6 +691,7 @@ void OnDeinit(const int reason)
    ObjectDelete(0, "BtnLotPlus");
    ObjectDelete(0, "BtnToggleStartTimer");
    ObjectDelete(0, "ValStartTimer");
+   ObjectDelete(0, "BtnToggleConsecutive");
    ObjectDelete(0, "BtnToggleCamarilla");
    ObjectDelete(0, "LblCamarilla");
    ObjectDelete(0, "ValCamarilla");
@@ -718,8 +772,14 @@ void OnTick()
 
    if(!isTradingActive || tradingDone)
      {
-      if(CheckStartTimer())
-        return;
+      // شروع خودکار شبکه بعدی (شبکه‌های متوالی) در اولویت اول
+      if(ProcessPendingNextGrid())
+         return;
+
+      // تایمر شروع فقط وقتی زمان‌بندی خودکاری در جریان نیست
+      if(g_NextGridStartTime <= 0 && CheckStartTimer())
+         return;
+
       UpdateChartComment();
       CheckTrendStrengthNotification();
       return;
@@ -731,7 +791,7 @@ void OnTick()
       int currentBuy  = CountPositionsByType(POSITION_TYPE_BUY);
       int currentSell = CountPositionsByType(POSITION_TYPE_SELL);
 
-      PrintFormat("🔍 Method0 | currentBuy: %d, lastBuyPosCount: %d | currentSell: %d, lastSellPosCount: %d",
+      if(EnableDebugLog) PrintFormat("🔍 Method0 | currentBuy: %d, lastBuyPosCount: %d | currentSell: %d, lastSellPosCount: %d",
                   currentBuy, lastBuyPosCount, currentSell, lastSellPosCount);
 
       if(currentBuy > lastBuyPosCount)
@@ -859,6 +919,7 @@ void OnChartEvent(const int id, const long &lparam, const double &dparam, const 
    if(sparam == "BtnCloseProfitable")  { CloseProfitableGrid(); return; }
    if(sparam == "BtnCloseAllGrid")     { CloseAllGrid();        return; }
    if(sparam == "BtnToggleStartTimer") { ToggleStartTimer();    return; }
+   if(sparam == "BtnToggleConsecutive") { ToggleConsecutiveGrids(); return; }
    if(sparam == "BtnFinishGrid")        { FinalizeGrid();          return; }
 
    if(sparam == "BtnBuyExpPlus")
@@ -866,56 +927,56 @@ void OnChartEvent(const int id, const long &lparam, const double &dparam, const 
       g_MaxBuyExpansions = MathMin(g_MaxBuyExpansions + 1, 100000);
       UpdateExpansionLabels();
       SaveState();
-      Print("MaxBuyExpansions → ", g_MaxBuyExpansions);
+      if(EnableDebugLog) Print("MaxBuyExpansions → ", g_MaxBuyExpansions);
      }
    else if(sparam == "BtnBuyExpPlus50")
      {
       g_MaxBuyExpansions = MathMin(g_MaxBuyExpansions + 50, 100000);
       UpdateExpansionLabels();
       SaveState();
-      Print("MaxBuyExpansions → ", g_MaxBuyExpansions);
+      if(EnableDebugLog) Print("MaxBuyExpansions → ", g_MaxBuyExpansions);
      }
    else if(sparam == "BtnBuyExpZero")
      {
       g_MaxBuyExpansions = 0;
       UpdateExpansionLabels();
       SaveState();
-      Print("MaxBuyExpansions → ", g_MaxBuyExpansions);
+      if(EnableDebugLog) Print("MaxBuyExpansions → ", g_MaxBuyExpansions);
      }
    else if(sparam == "BtnBuyExpMinus")
      {
       g_MaxBuyExpansions = MathMax(g_MaxBuyExpansions - 1, 0);
       UpdateExpansionLabels();
       SaveState();
-      Print("MaxBuyExpansions → ", g_MaxBuyExpansions);
+      if(EnableDebugLog) Print("MaxBuyExpansions → ", g_MaxBuyExpansions);
      }
    else if(sparam == "BtnSellExpPlus")
      {
       g_MaxSellExpansions = MathMin(g_MaxSellExpansions + 1, 100000);
       UpdateExpansionLabels();
       SaveState();
-      Print("MaxSellExpansions → ", g_MaxSellExpansions);
+      if(EnableDebugLog) Print("MaxSellExpansions → ", g_MaxSellExpansions);
      }
    else if(sparam == "BtnSellExpPlus50")
      {
       g_MaxSellExpansions = MathMin(g_MaxSellExpansions + 50, 100000);
       UpdateExpansionLabels();
       SaveState();
-      Print("MaxSellExpansions → ", g_MaxSellExpansions);
+      if(EnableDebugLog) Print("MaxSellExpansions → ", g_MaxSellExpansions);
      }
    else if(sparam == "BtnSellExpZero")
      {
       g_MaxSellExpansions = 0;
       UpdateExpansionLabels();
       SaveState();
-      Print("MaxSellExpansions → ", g_MaxSellExpansions);
+      if(EnableDebugLog) Print("MaxSellExpansions → ", g_MaxSellExpansions);
      }
    else if(sparam == "BtnSellExpMinus")
      {
       g_MaxSellExpansions = MathMax(g_MaxSellExpansions - 1, 0);
       UpdateExpansionLabels();
       SaveState();
-      Print("MaxSellExpansions → ", g_MaxSellExpansions);
+      if(EnableDebugLog) Print("MaxSellExpansions → ", g_MaxSellExpansions);
      }
 
   else if(sparam == "BtnLotPlus")
@@ -924,7 +985,7 @@ void OnChartEvent(const int id, const long &lparam, const double &dparam, const 
         {
          UpdateLotLabel();
          SaveState();
-         Print("حجم جدید: ", DoubleToString(g_CurrentLot, 3));
+         if(EnableDebugLog) Print("حجم جدید: ", DoubleToString(g_CurrentLot, 3));
         }
       return;
      }
@@ -932,7 +993,7 @@ void OnChartEvent(const int id, const long &lparam, const double &dparam, const 
      {
       g_EnableCamarillaCheck = !g_EnableCamarillaCheck;
       UpdateCamarillaLabel();
-      PrintFormat("EnableCamarillaCheck → %s", g_EnableCamarillaCheck ? "true" : "false");
+      if(EnableDebugLog) PrintFormat("EnableCamarillaCheck → %s", g_EnableCamarillaCheck ? "true" : "false");
       return;
      }
    else if(sparam == "BtnToggleCamarillaRange")
@@ -941,22 +1002,22 @@ void OnChartEvent(const int id, const long &lparam, const double &dparam, const 
       if(g_CamarillaRange == MODE_H1_L1)
         {
          g_CamarillaRange = MODE_H2_L2;
-         Print("🔄 بازه تغییر یافت: H2-L2");
+         if(EnableDebugLog) Print("🔄 بازه تغییر یافت: H2-L2");
         }
       else if(g_CamarillaRange == MODE_H2_L2)
         {
          g_CamarillaRange = MODE_H3_L3;
-         Print("🔄 بازه تغییر یافت: H3-L3");
+         if(EnableDebugLog) Print("🔄 بازه تغییر یافت: H3-L3");
         }
       else if(g_CamarillaRange == MODE_H3_L3)
         {
          g_CamarillaRange = MODE_CUSTOM;
-         PrintFormat("🔄 بازه تغییر یافت: CUSTOM (%d-%d)", CamarillaCustomUpper, CamarillaCustomLower);
+         if(EnableDebugLog) PrintFormat("🔄 بازه تغییر یافت: CUSTOM (%d-%d)", CamarillaCustomUpper, CamarillaCustomLower);
         }
       else // MODE_CUSTOM
         {
          g_CamarillaRange = MODE_H1_L1;
-         Print("🔄 بازه تغییر یافت: H1-L1");
+         if(EnableDebugLog) Print("🔄 بازه تغییر یافت: H1-L1");
         }
       UpdateCamarillaLabel();
       return;
@@ -966,7 +1027,7 @@ void OnChartEvent(const int id, const long &lparam, const double &dparam, const 
       g_EnableCamarillaRangeCheck = !g_EnableCamarillaRangeCheck;
       ObjectSetString(0, "ValRangeEnabled", OBJPROP_TEXT, g_EnableCamarillaRangeCheck ? "ON" : "OFF");
       ObjectSetInteger(0, "ValRangeEnabled", OBJPROP_COLOR, g_EnableCamarillaRangeCheck ? clrLime : clrRed);
-      PrintFormat("✓ Range Check → %s", g_EnableCamarillaRangeCheck ? "ON" : "OFF");
+      if(EnableDebugLog) PrintFormat("✓ Range Check → %s", g_EnableCamarillaRangeCheck ? "ON" : "OFF");
       return;
      }
    else if(sparam == "BtnTrailingActivationPlus")
@@ -976,7 +1037,7 @@ void OnChartEvent(const int id, const long &lparam, const double &dparam, const 
     // بروزرسانی نمایش قیمت مربوط به مقدار جدید تریلینگ
     UpdateTrailingDisplay();
       SaveState();
-      PrintFormat("TrailingActivation → %.2f USD", g_TrailingActivation);
+      if(EnableDebugLog) PrintFormat("TrailingActivation → %.2f USD", g_TrailingActivation);
       return;
      }
    else if(sparam == "BtnTrailingActivationMinus")
@@ -986,7 +1047,7 @@ void OnChartEvent(const int id, const long &lparam, const double &dparam, const 
     // بروزرسانی نمایش قیمت مربوط به مقدار جدید تریلینگ
     UpdateTrailingDisplay();
       SaveState();
-      PrintFormat("TrailingActivation → %.2f USD", g_TrailingActivation);
+      if(EnableDebugLog) PrintFormat("TrailingActivation → %.2f USD", g_TrailingActivation);
       return;
      }
    else if(sparam == "BtnLotMinus")
@@ -995,16 +1056,218 @@ void OnChartEvent(const int id, const long &lparam, const double &dparam, const 
         {
          UpdateLotLabel();
          SaveState();
-         Print("حجم جدید: ", DoubleToString(g_CurrentLot, 3));
+         if(EnableDebugLog) Print("حجم جدید: ", DoubleToString(g_CurrentLot, 3));
         }
       return;
      }
   }
 
 //+------------------------------------------------------------------+
-//| شروع شبکه با دکمه                                               |
+//| زمان‌بندی شروع خودکار شبکه بعدی پس از پایان شبکه فعلی              |
+//| فقط در صورت فعال بودن g_EnableConsecutiveGrids زمان‌بندی می‌شود     |
 //+------------------------------------------------------------------+
-void StartGridByButton()
+void ScheduleNextGrid()
+  {
+   if(!g_EnableConsecutiveGrids)
+     {
+      g_NextGridStartTime = 0;
+      return;
+     }
+
+   int delaySec = MathMax(ConsecutiveGridDelaySec, 0);
+   g_SessionClosedCount++;   // این شبکه هم بسته شد و جزو زنجیره است
+   g_NextGridStartTime = TimeCurrent() + delaySec;
+   SaveState();
+   PrintFormat("🔁 شبکه‌های متوالی فعال است؛ شروع خودکار شبکه بعدی %d ثانیه دیگر (%s).",
+               delaySec, TimeToString(g_NextGridStartTime, TIME_DATE|TIME_SECONDS));
+  }
+
+//+------------------------------------------------------------------+
+//| بررسی و اجرای شروع خودکار شبکه بعدی                               |
+//| اگر شبکه قبلی هنوز چیزی برای بستن دارد، بی‌صدا صبر می‌کند           |
+//+------------------------------------------------------------------+
+bool ProcessPendingNextGrid()
+  {
+   if(g_NextGridStartTime <= 0)
+      return false;
+
+   if(!g_EnableConsecutiveGrids)
+     {
+      g_NextGridStartTime = 0;
+      SaveState();
+      Print("⛔ شبکه‌های متوالی غیرفعال شد؛ زمان‌بندی شبکه بعدی لغو گردید.");
+      return false;
+     }
+
+   if(TimeCurrent() < g_NextGridStartTime)
+      return false;   // هنوز داخل بازه تاخیر هستیم
+
+   if(AnyGridExists())
+      return false;   // شبکه قبلی هنوز کامل بسته نشده؛ به‌محض بسته شدن شروع می‌کند
+
+   PrintFormat("🔁 تاخیر تمام شد؛ شروع خودکار شبکه جدید (Magic پیشین=%d).", g_ActiveMagic);
+   g_NextGridStartTime = 0;
+   StartGridByButton(true);
+   return true;
+  }
+
+//+------------------------------------------------------------------+
+//| محاسبه سود/زیان کل زنجیره شبکه‌های متوالی                         |
+//| شامل پوزیشن‌های باز و تمام معاملات بسته‌شده از ابتدای زنجیره       |
+//+------------------------------------------------------------------+
+double CalculateSessionProfit()
+  {
+   if(!g_SessionStarted)
+      return 0.0;
+   if(g_ActiveMagic < g_SessionStartMagic)
+      return 0.0;
+
+   int startMagic = g_SessionStartMagic;
+   int endMagic   = g_ActiveMagic;
+   double profit  = 0.0;
+
+   // ۱) پوزیشن‌های باز زنجیره
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+     {
+      ulong t = PositionGetTicket(i);
+      if(!PositionSelectByTicket(t)) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      long magic = PositionGetInteger(POSITION_MAGIC);
+      if(magic < startMagic || magic > endMagic) continue;
+      if(g_SessionStartTime > 0 && PositionGetInteger(POSITION_TIME) < (long)g_SessionStartTime) continue;
+      profit += PositionGetDouble(POSITION_PROFIT);
+     }
+
+   // ۲) معاملات بسته‌شده زنجیره (فقط بازه زمانی زنجیره اسکن می‌شود)
+   datetime from = (g_SessionStartTime > 0) ? g_SessionStartTime : 0;
+   if(!HistorySelect(from, TimeCurrent()))
+      return profit;
+
+   int totalDeals = HistoryDealsTotal();
+   for(int i = 0; i < totalDeals; i++)
+     {
+      ulong deal = HistoryDealGetTicket(i);
+      if(deal == 0) continue;
+      if(HistoryDealGetString(deal, DEAL_SYMBOL) != _Symbol) continue;
+      long magic = HistoryDealGetInteger(deal, DEAL_MAGIC);
+      if(magic < startMagic || magic > endMagic) continue;
+
+      long dealType = HistoryDealGetInteger(deal, DEAL_TYPE);
+      if(dealType != DEAL_TYPE_BUY && dealType != DEAL_TYPE_SELL) continue;
+
+      long entryType = HistoryDealGetInteger(deal, DEAL_ENTRY);
+      if(entryType != DEAL_ENTRY_OUT &&
+         entryType != DEAL_ENTRY_INOUT &&
+         entryType != DEAL_ENTRY_OUT_BY)
+         continue;
+
+      profit += HistoryDealGetDouble(deal, DEAL_PROFIT);
+      profit += HistoryDealGetDouble(deal, DEAL_SWAP);
+      profit += HistoryDealGetDouble(deal, DEAL_COMMISSION);
+      profit += HistoryDealGetDouble(deal, DEAL_FEE);
+     }
+
+   return profit;
+  }
+
+//+------------------------------------------------------------------+
+//| شروع یک زنجیره جدید شبکه‌های متوالی                               |
+//+------------------------------------------------------------------+
+void BeginConsecutiveSession()
+  {
+   if(g_SessionStarted && g_SessionGridCount > 0)
+      PrintFormat("🔗 زنجیره قبلی خلاصه شد | شبکه: %d باز شد / %d بسته شد | سود/زیان کل: %.2f$",
+                  g_SessionGridCount, g_SessionClosedCount, CalculateSessionProfit());
+
+   g_SessionStarted     = true;
+   g_SessionActive      = true;
+   g_SessionStartMagic  = g_ActiveMagic;
+   g_SessionStartTime   = TimeCurrent();
+   g_SessionGridCount   = 0;
+   g_SessionClosedCount = 0;
+   PrintFormat("🔗 زنجیره جدید شبکه‌های متوالی آغاز شد | Magic=%d | زمان=%s",
+               g_SessionStartMagic, TimeToString(g_SessionStartTime, TIME_DATE|TIME_SECONDS));
+  }
+
+//+------------------------------------------------------------------+
+//| خاتمه زنجیره؛ آمار نهایی حفظ می‌شود ولی شبکه جدیدی به آن اضافه نمی‌شود
+//+------------------------------------------------------------------+
+void EndConsecutiveSession()
+  {
+   if(!g_SessionActive)
+      return;
+   g_SessionActive = false;
+   SaveState();
+   PrintFormat("🔗 زنجیره شبکه‌های متوالی خاتمه یافت | باز شده: %d | بسته شده: %d | سود/زیان کل: %.2f$",
+               g_SessionGridCount, g_SessionClosedCount, CalculateSessionProfit());
+  }
+
+//+------------------------------------------------------------------+
+//| متن وضعیت و شمارش معکوس شبکه‌های متوالی برای چارت                  |
+//+------------------------------------------------------------------+
+string ConsecutiveGridStatusText()
+  {
+   string text = "🔁 شبکه متوالی: " + (g_EnableConsecutiveGrids ? "فعال" : "غیرفعال") +
+                 " (تاخیر " + IntegerToString(MathMax(ConsecutiveGridDelaySec, 0)) + " ثانیه)\n";
+
+   if(g_EnableConsecutiveGrids && g_NextGridStartTime > 0)
+     {
+      int remain = (int)(g_NextGridStartTime - TimeCurrent());
+      if(remain < 0) remain = 0;
+      text += "⏳ شروع خودکار شبکه بعدی: " + IntegerToString(remain) + " ثانیه باقی مانده\n";
+     }
+
+   if(g_SessionStarted)
+      text += "🔗 زنجیره: " + IntegerToString(g_SessionGridCount) + " شبکه باز شد | " +
+              IntegerToString(g_SessionClosedCount) + " بسته شد" +
+              (g_SessionActive ? " (ادامه دارد)" : " (خاتمه یافت)") + "\n" +
+              "💰 سود/زیان کل زنجیره: " + DoubleToString(CalculateSessionProfit(), 2) + " $\n";
+
+   return text;
+  }
+
+//+------------------------------------------------------------------+
+//| تغییر وضعیت شبکه‌های متوالی                                       |
+//+------------------------------------------------------------------+
+void ToggleConsecutiveGrids()
+  {
+   g_EnableConsecutiveGrids = !g_EnableConsecutiveGrids;
+   if(!g_EnableConsecutiveGrids)
+     {
+      g_NextGridStartTime = 0;   // با غیرفعال کردن، زمان‌بندی در انتظار لغو می‌شود
+      EndConsecutiveSession();   // آمار نهایی زنجیره حفظ می‌شود، ولی زنجیره بسته می‌شود
+     }
+
+   UpdateConsecutiveGridsButton();
+   SaveState();
+   PrintFormat("🔁 شبکه‌های متوالی %s شد.", g_EnableConsecutiveGrids ? "فعال" : "غیرفعال");
+  }
+
+//+------------------------------------------------------------------+
+//| بروزرسانی وضعیت دکمه شبکه‌های متوالی روی چارت                     |
+//+------------------------------------------------------------------+
+void UpdateConsecutiveGridsButton()
+  {
+   if(ObjectFind(0, "BtnToggleConsecutive") < 0) return;
+   string status = g_EnableConsecutiveGrids ? "ON" : "OFF";
+   ObjectSetString (0, "BtnToggleConsecutive", OBJPROP_TEXT, "متوالی: " + status);
+   ObjectSetInteger(0, "BtnToggleConsecutive", OBJPROP_BGCOLOR,
+                    g_EnableConsecutiveGrids ? clrMediumSeaGreen : clrGray);
+  }
+
+//+------------------------------------------------------------------+
+//| دکمه فعال/غیرفعال شبکه‌های متوالی (در راستای دکمه شروع شبکه)      |
+//+------------------------------------------------------------------+
+void CreateConsecutiveGridsButton()
+  {
+   CreateButton("BtnToggleConsecutive", "متوالی: OFF", 438, 33, 76, 24, clrWhite, clrGray, 8);
+   UpdateConsecutiveGridsButton();
+  }
+
+//+------------------------------------------------------------------+
+//| شروع شبکه؛ continueSession=true یعنی ادامه زنجیره متوالی فعلی      |
+//+------------------------------------------------------------------+
+void StartGridByButton(bool continueSession = false)
   {
    if(AnyGridExists())
      {
@@ -1012,7 +1275,12 @@ void StartGridByButton()
       return;
      }
    Print("▶ ایجاد شبکه جدید...");
-   
+
+   // شروع دستی همیشه زنجیره تازه‌ای می‌سازد؛ شروع خودکار زنجیره را ادامه می‌دهد
+   if(!continueSession || !g_SessionActive)
+      BeginConsecutiveSession();
+   g_SessionGridCount++;
+
    // تشخیص حالت
    if(GridLevelsBuy > 0 && GridLevelsSell > 0)
      {
@@ -1029,6 +1297,7 @@ void StartGridByButton()
    
    isTradingActive = true;
    ResetFloatingExtremes();
+   g_NextGridStartTime = 0;   // شروع دستی یا خودکار، زمان‌بندی قبلی را بی‌اثر می‌کند
 
    tradingDone     = false;
 
@@ -1072,7 +1341,10 @@ void ExecuteStrategy()
 
    // بررسی حالت متقارن (خرید و فروش همزمان)
    g_SymmetricMode = (GridLevelsBuy > 0 && GridLevelsSell > 0);
-   
+
+   // نمایش فوری وضعیت شبکه روی چارت، حتی پیش از ثبت اولین سفارش
+   UpdateChartComment();
+
    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
 
@@ -1080,18 +1352,22 @@ void ExecuteStrategy()
      {
       // حالت متقارن: خرید و فروش را همزمان شروع کن
       Print("🔄 حالت متقارن فعال: خرید(", GridLevelsBuy, ") + فروش(", GridLevelsSell, ")");
-      
+
+      g_GridDirection = -1; // حالت خاص: هر دو سمت
+
       // پله اول خرید
       double sl_buy = (SL_Points > 0) ? PointToPrice(ask, SL_Points, true,  true) : 0;
       double tp_buy = (TP_Points > 0) ? PointToPrice(ask, TP_Points, false, true) : 0;
       PlaceInitialLimit(ORDER_TYPE_BUY, CalcLotForSide(true, 1), sl_buy, tp_buy, "اولیه");
-      
+      if(RefreshPlacementProgress())
+         return;
+
       // پله اول فروش
       double sl_sell = (SL_Points > 0) ? PointToPrice(bid, SL_Points, true,  false) : 0;
       double tp_sell = (TP_Points > 0) ? PointToPrice(bid, TP_Points, false, false) : 0;
       PlaceInitialLimit(ORDER_TYPE_SELL, CalcLotForSide(false, 1), sl_sell, tp_sell, "اولیه");
-      
-      g_GridDirection = -1; // حالت خاص: هر دو سمت
+      if(RefreshPlacementProgress())
+         return;
      }
    else
      {
@@ -1122,10 +1398,17 @@ void ExecuteStrategy()
          double tp = (TP_Points > 0) ? PointToPrice(bid, TP_Points, false, false) : 0;
          PlaceInitialLimit(ORDER_TYPE_SELL, CalcLotForSide(false, 1), sl, tp, "اولیه");
         }
+
+      if(RefreshPlacementProgress())
+         return;
      }
 
     ResetFloatingExtremes();
     PlaceGrid();
+
+   // اگر چیدن سفارش‌ها در حین کار به پایان شبکه منجر شده باشد، ادامه نده
+   if(!isTradingActive || tradingDone)
+      return;
 
    lastBuyExpansionPrice  = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    lastSellExpansionPrice = SymbolInfoDouble(_Symbol, SYMBOL_BID);
@@ -1390,7 +1673,7 @@ bool PlaceInitialLimit(ENUM_ORDER_TYPE type, double lot, double sl, double tp, s
    // بررسی بازه سطوح کاماریلا
    if(!IsPriceWithinCamarillaRange(price))
      {
-      PrintFormat("⛔ سفارش اولیه ایجاد نشد - قیمت خارج از بازه: %.5f", price);
+      if(EnableDebugLog) PrintFormat("⛔ سفارش اولیه ایجاد نشد - قیمت خارج از بازه: %.5f", price);
       return false;
      }
    
@@ -1401,7 +1684,7 @@ bool PlaceInitialLimit(ENUM_ORDER_TYPE type, double lot, double sl, double tp, s
    ENUM_ORDER_TYPE checkType = (type == ORDER_TYPE_BUY) ? ORDER_TYPE_BUY_STOP : ORDER_TYPE_SELL_STOP;
    if(IsTooCloseToExisting(price, checkType))
      {
-      PrintFormat("⛔ جلوگیری از ثبت سفارش اولیه - خیلی نزدیک به سفارش/پوزیشن موجود (price=%.5f)", price);
+      if(EnableDebugLog) PrintFormat("⛔ جلوگیری از ثبت سفارش اولیه - خیلی نزدیک به سفارش/پوزیشن موجود (price=%.5f)", price);
       return false;
      }
 
@@ -1442,8 +1725,39 @@ bool PlaceInitialLimit(ENUM_ORDER_TYPE type, double lot, double sl, double tp, s
       return false;
      }
    g_OrderCommentSeq = commentSeq;
-   PrintFormat("✅ %s | Price=%.5f | SL=%.5f | TP=%.5f | Lot=%.2f",
+   if(EnableDebugLog) PrintFormat("✅ %s | Price=%.5f | SL=%.5f | TP=%.5f | Lot=%.2f",
                orderComment, price, sl, tp, lot);
+   return true;
+  }
+
+//+------------------------------------------------------------------+
+//| به‌روزرسانی فوری کامنت چارت و بررسی توقف چیدن سفارش‌ها            |
+//| بعد از هر سفارش اولیه فراخوانی می‌شود تا:                          |
+//| ۱) کامنت چارت بلافاصله وضعیت شبکه را نشان دهد                     |
+//| ۲) اگر شبکه پیش از کامل شدن چیدمان به حد سود/ضرر کلی رسیده باشد،    |
+//|    ادامه ثبت سفارش‌ها لغو و شبکه همان لحظه به پایان برسد            |
+//| مقدار true یعنی باید چیدن سفارش‌ها فورا متوقف شود                  |
+//+------------------------------------------------------------------+
+bool RefreshPlacementProgress()
+  {
+   UpdateChartComment();
+
+   if(!isTradingActive || tradingDone)
+      return true;
+
+   // تا وقتی هیچ پوزیشنی باز نشده، سود/ضرری وجود ندارد
+   int openCount = CountPositionsByType(POSITION_TYPE_BUY) +
+                   CountPositionsByType(POSITION_TYPE_SELL);
+   if(openCount == 0)
+      return false;
+
+   double totalProfit = CalculateTotalProfit() + CalculateClosedGridProfit();
+   if(totalProfit < TotalProfitTarget && totalProfit > TotalStopLoss)
+      return false;   // هنوز به هیچ‌کدام از دو حد نرسیده
+
+   PrintFormat("⛔ چیدن سفارش‌ها لغو شد؛ حد سود/ضرر کلی در حین چیدن لمس شد (کل=%.2f$). "
+               "بستن همه و پایان شبکه...", totalProfit);
+   CheckTotalProfitLoss();
    return true;
   }
 
@@ -1475,6 +1789,8 @@ void PlaceGrid()
          double sl  = (SL_Points > 0) ? PointToPrice(entry, SL_Points, true,  true) : 0;
          double tp  = (TP_Points > 0) ? PointToPrice(entry, TP_Points, false, true) : 0;
          PlacePendingOrder(ORDER_TYPE_BUY_STOP, lot, entry, sl, tp, "خرید");
+         if(RefreshPlacementProgress())
+            return;
         }
      }
    else if(g_GridDirection == ORDER_TYPE_SELL)
@@ -1487,6 +1803,8 @@ void PlaceGrid()
          double sl  = (SL_Points > 0) ? PointToPrice(entry, SL_Points, true,  false) : 0;
          double tp  = (TP_Points > 0) ? PointToPrice(entry, TP_Points, false, false) : 0;
          PlacePendingOrder(ORDER_TYPE_SELL_STOP, lot, entry, sl, tp, "فروش");
+         if(RefreshPlacementProgress())
+            return;
         }
      }
    else // حالت متقارن: هر دو سمت را ثبت کن
@@ -1502,6 +1820,8 @@ void PlaceGrid()
             double sl  = (SL_Points > 0) ? PointToPrice(entry, SL_Points, true,  true) : 0;
             double tp  = (TP_Points > 0) ? PointToPrice(entry, TP_Points, false, true) : 0;
             PlacePendingOrder(ORDER_TYPE_BUY_STOP, lot, entry, sl, tp, "خرید");
+            if(RefreshPlacementProgress())
+               return;
            }
          if(i <= actualSellLevels)
            {
@@ -1511,6 +1831,8 @@ void PlaceGrid()
             double sl  = (SL_Points > 0) ? PointToPrice(entry, SL_Points, true,  false) : 0;
             double tp  = (TP_Points > 0) ? PointToPrice(entry, TP_Points, false, false) : 0;
             PlacePendingOrder(ORDER_TYPE_SELL_STOP, lot, entry, sl, tp, "فروش");
+            if(RefreshPlacementProgress())
+               return;
            }
         }
      }
@@ -1535,14 +1857,14 @@ bool PlacePendingOrder(ENUM_ORDER_TYPE type, double lot, double entry,
    // proximity check before placing pending order
    if(IsTooCloseToExisting(entry, type))
      {
-      PrintFormat("⛔ جلوگیری از ثبت سفارش معلق '%s' - خیلی نزدیک به سفارش/پوزیشن موجود (entry=%.5f)", comment, entry);
+      if(EnableDebugLog) PrintFormat("⛔ جلوگیری از ثبت سفارش معلق '%s' - خیلی نزدیک به سفارش/پوزیشن موجود (entry=%.5f)", comment, entry);
       return false;
      }
    
    // بررسی بازه سطوح کاماریلا برای سفارش معلق
    if(!IsPriceWithinCamarillaRange(entry))
      {
-      PrintFormat("⛔ سفارش معلق '%s' ایجاد نشد - قیمت خارج از بازه: %.5f", comment, entry);
+      if(EnableDebugLog) PrintFormat("⛔ سفارش معلق '%s' ایجاد نشد - قیمت خارج از بازه: %.5f", comment, entry);
       return false;
      }
 
@@ -1568,7 +1890,7 @@ bool PlacePendingOrder(ENUM_ORDER_TYPE type, double lot, double entry,
       return false;
      }
    g_OrderCommentSeq = commentSeq;
-   PrintFormat("✅ %s | Entry=%.5f | SL=%.5f | TP=%.5f | Lot=%.2f",
+   if(EnableDebugLog) PrintFormat("✅ %s | Entry=%.5f | SL=%.5f | TP=%.5f | Lot=%.2f",
                orderComment, entry, sl, tp, lot);
    return true;
   }
@@ -1581,7 +1903,7 @@ bool TryBuyExpansion(string reason)
    if(buyExpansionCount >= g_MaxBuyExpansions)
       return false;
 
-   PrintFormat("%s - گسترش خرید %d/%d", reason, buyExpansionCount+1, g_MaxBuyExpansions);
+   if(EnableDebugLog) PrintFormat("%s - گسترش خرید %d/%d", reason, buyExpansionCount+1, g_MaxBuyExpansions);
    if(!BuyAdjustment())
       return false;
 
@@ -1599,7 +1921,7 @@ bool TrySellExpansion(string reason)
    if(sellExpansionCount >= g_MaxSellExpansions)
       return false;
 
-   PrintFormat("%s - گسترش فروش %d/%d", reason, sellExpansionCount+1, g_MaxSellExpansions);
+   if(EnableDebugLog) PrintFormat("%s - گسترش فروش %d/%d", reason, sellExpansionCount+1, g_MaxSellExpansions);
    if(!SellAdjustment())
       return false;
 
@@ -1671,7 +1993,7 @@ bool IsTooCloseToExisting(double price, ENUM_ORDER_TYPE orderType)
       double existingPrice = OrderGetDouble(ORDER_PRICE_OPEN);
       if(MathAbs(price - existingPrice) < minDistPrice)
         {
-         PrintFormat("❌ سفارش جدید %.5f بیش از حد به سفارش موجود %.5f نزدیک است (فاصله %.1f پیپ، حداقل مجاز %.1f پیپ)",
+         if(EnableDebugLog) PrintFormat("❌ سفارش جدید %.5f بیش از حد به سفارش موجود %.5f نزدیک است (فاصله %.1f پیپ، حداقل مجاز %.1f پیپ)",
                      price, existingPrice, MathAbs(price - existingPrice)/_Point, minDistPoints);
          return true;
         }
@@ -1690,7 +2012,7 @@ bool IsTooCloseToExisting(double price, ENUM_ORDER_TYPE orderType)
       double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
       if(MathAbs(price - openPrice) < minDistPrice)
         {
-         PrintFormat("❌ سفارش جدید %.5f بیش از حد به پوزیشن باز %.5f نزدیک است (فاصله %.1f پیپ، حداقل مجاز %.1f پیپ)",
+         if(EnableDebugLog) PrintFormat("❌ سفارش جدید %.5f بیش از حد به پوزیشن باز %.5f نزدیک است (فاصله %.1f پیپ، حداقل مجاز %.1f پیپ)",
                      price, openPrice, MathAbs(price - openPrice)/_Point, minDistPoints);
          return true;
         }
@@ -1714,13 +2036,13 @@ bool BuyAdjustment()
 
   if(IsNearCamarillaLevel(candidate, CamarillaDistance))
   {
-   Print("🔧 BuyAdjustment | به دلیل نزدیکی به سطح کاماریلا، سفارش جدید ایجاد نشد.");
+   if(EnableDebugLog) Print("🔧 BuyAdjustment | به دلیل نزدیکی به سطح کاماریلا، سفارش جدید ایجاد نشد.");
    return false;
   }
 
   if(IsTooCloseToExisting(candidate, ORDER_TYPE_BUY_STOP))
   {
-   Print("🔧 BuyAdjustment | به دلیل فاصله کم، سفارش جدید ایجاد نشد.");
+   if(EnableDebugLog) Print("🔧 BuyAdjustment | به دلیل فاصله کم، سفارش جدید ایجاد نشد.");
    return false;
   }
 
@@ -1731,7 +2053,7 @@ bool BuyAdjustment()
    double tp  = (TP_Points > 0) ? PointToPrice(candidate, TP_Points, false, true) : 0;
    if(PlacePendingOrder(ORDER_TYPE_BUY_STOP, lot, candidate, sl, tp, "خرید"))
      {
-      Print("🔧 BuyAdjustment | سفارش جدید ثبت شد.");
+      if(EnableDebugLog) Print("🔧 BuyAdjustment | سفارش جدید ثبت شد.");
       return true;
      }
    return false;
@@ -1753,13 +2075,13 @@ bool SellAdjustment()
 
   if(IsNearCamarillaLevel(candidate, CamarillaDistance))
   {
-   Print("🔧 SellAdjustment | به دلیل نزدیکی به سطح کاماریلا، سفارش جدید ایجاد نشد.");
+   if(EnableDebugLog) Print("🔧 SellAdjustment | به دلیل نزدیکی به سطح کاماریلا، سفارش جدید ایجاد نشد.");
    return false;
   }
 
    if(IsTooCloseToExisting(candidate, ORDER_TYPE_SELL_STOP))
   {
-   Print("🔧 SellAdjustment | به دلیل فاصله کم، سفارش جدید ایجاد نشد.");
+   if(EnableDebugLog) Print("🔧 SellAdjustment | به دلیل فاصله کم، سفارش جدید ایجاد نشد.");
    return false;
   }
   
@@ -1770,7 +2092,7 @@ bool SellAdjustment()
    double tp  = (TP_Points > 0) ? PointToPrice(candidate, TP_Points, false, false) : 0;
    if(PlacePendingOrder(ORDER_TYPE_SELL_STOP, lot, candidate, sl, tp, "فروش"))
      {
-      Print("🔧 SellAdjustment | سفارش جدید ثبت شد.");
+      if(EnableDebugLog) Print("🔧 SellAdjustment | سفارش جدید ثبت شد.");
       return true;
      }
    return false;
@@ -1972,6 +2294,7 @@ void CheckTotalProfitLoss()
       ClearState();
       SaveState();
       PrintFormat("شبکه با Magic=%d بسته شد. Magic جدید=%d آماده‌ی شروع.", oldMagic, g_ActiveMagic);
+      ScheduleNextGrid();
      }
    // --- بررسی حد ضرر کل (باز + بسته) ---
    else if(totalProfit <= TotalStopLoss)
@@ -2026,6 +2349,7 @@ void CheckTotalProfitLoss()
       ClearState();
       SaveState();
       PrintFormat("شبکه با Magic=%d بسته شد. Magic جدید=%d آماده‌ی شروع.", oldMagic, g_ActiveMagic);
+      ScheduleNextGrid();
      }
 
    ResetTrailingState();
@@ -2097,6 +2421,7 @@ void CheckBasketTrailingStop()
       ClearState();
       SaveState();
       PrintFormat("شبکه با Magic=%d بسته شد (تریلینگ). Magic جدید=%d آماده‌ی شروع.", oldMagic, g_ActiveMagic);
+      ScheduleNextGrid();
       return;
      }
 
@@ -2140,12 +2465,15 @@ void CloseAll()
    double currentPrice = (SymbolInfoDouble(_Symbol, SYMBOL_ASK) + 
                           SymbolInfoDouble(_Symbol, SYMBOL_BID)) / 2.0;
 
-   // نسخه سریع (همان حالت قبلی): حذف اوردرهای معلق و بستن همه پوزیشن‌ها به صورت async یکجا
+   // اولویت ۱: بستن همه پوزیشن‌های باز (چه سودده چه ضررده) به صورت سینک.
+   // دلیل: برآیند همه پوزیشن‌ها همان عددی است که حد سود/ضرر کلی را لمس کرده،
+   // پس باید قبل از دست زدن به سفارشات معلق بسته شوند تا قیمت فرصت فاصله گرفتن نداشته باشد.
+   bool anyClosed = false;
+   ClosePositionsNearestFirstBlocking(currentPrice, anyClosed);
+
+   // اولویت ۲: پس از بسته شدن کامل پوزیشن‌ها، حذف سفارشات معلق باقی‌مانده.
    bool anyDeleted = false;
    DeleteOrdersNearestFirst(currentPrice, anyDeleted);
-
-   bool anyClosed = false;
-   ClosePositionsNearestFirst(currentPrice, anyClosed);
 
    if(!AnyGridExists())
      {
@@ -2168,13 +2496,12 @@ void CloseAll()
       currentPrice = (SymbolInfoDouble(_Symbol, SYMBOL_ASK) +
                        SymbolInfoDouble(_Symbol, SYMBOL_BID)) / 2.0;
 
-      // حذف مجدد سفارش‌های معلق
+      // retry: ابتدا بستن باقی‌مانده‌ی پوزیشن‌ها به صورت سینک، سپس حذف سفارش‌های معلق
+      anyClosed = false;
+      ClosePositionsNearestFirstBlocking(currentPrice, anyClosed);
+
       anyDeleted = false;
       DeleteOrdersNearestFirst(currentPrice, anyDeleted);
-
-      // retry: بستن باقی‌مانده‌ها به صورت سینک/دونه‌دونه (برای اطمینان)
-      bool anyClosedRetry = false;
-      ClosePositionsNearestFirstBlocking(currentPrice, anyClosedRetry);
 
       Sleep(retryEveryMs);
      }
@@ -2284,7 +2611,7 @@ void ClosePositionsNearestFirst(double currentPrice, bool &anyClosed)
    }
 
    if(sentCount > 0)
-      PrintFormat("✅ %d دستور بستن پوزیشن به‌صورت async ارسال شد.", sentCount);
+      if(EnableDebugLog) PrintFormat("✅ %d دستور بستن پوزیشن به‌صورت async ارسال شد.", sentCount);
 }
 
 //+------------------------------------------------------------------+
@@ -2425,7 +2752,7 @@ void DeleteOrdersNearestFirst(double currentPrice, bool &anyClosed)
       }
    }
 
-   PrintFormat("✅ %d دستور حذف به‌صورت async ارسال شد.", sentCount);
+   if(EnableDebugLog) PrintFormat("✅ %d دستور حذف به‌صورت async ارسال شد.", sentCount);
 }
 
 //+------------------------------------------------------------------+
@@ -2459,20 +2786,23 @@ void CloseAllGrid()
       SaveState();
       return;
      }
-   g_GridInstance++;
-   g_ActiveMagic = MagicNumber + g_GridInstance;
-   buyExpansionCount  = 0;
-   sellExpansionCount = 0;
-   lastBuyPosCount    = 0;
-   lastSellPosCount   = 0;
-   g_OrderCommentSeq  = 0;
-   g_GridID           = "";
-   isTradingActive = false;
-   tradingDone     = true;
-   ClearState();
-   SaveState();
-   ResetTrailingState();
-   PrintFormat("شبکه با Magic=%d بسته شد. Magic جدید=%d آماده‌ی شروع.", oldMagic, g_ActiveMagic);
+    g_GridInstance++;
+    g_ActiveMagic = MagicNumber + g_GridInstance;
+    buyExpansionCount  = 0;
+    sellExpansionCount = 0;
+    lastBuyPosCount    = 0;
+    lastSellPosCount   = 0;
+    g_OrderCommentSeq  = 0;
+    g_GridID           = "";
+    isTradingActive = false;
+    tradingDone     = true;
+    if(g_SessionActive)
+       g_SessionClosedCount++;   // بستن دستی هم شبکه بسته‌شده زنجیره محسوب می‌شود
+    ClearState();
+    SaveState();
+    ResetTrailingState();
+    EndConsecutiveSession();
+    PrintFormat("شبکه با Magic=%d بسته شد. Magic جدید=%d آماده‌ی شروع.", oldMagic, g_ActiveMagic);
   }
 
 //+------------------------------------------------------------------+
@@ -2496,9 +2826,10 @@ void FinalizeGrid()
    lastSellPosCount   = 0;
    g_OrderCommentSeq  = 0;
    g_GridID           = "";
-   isTradingActive    = false;
-   tradingDone        = true;
-   ClearState();
+    isTradingActive    = false;
+    tradingDone        = true;
+    EndConsecutiveSession();
+    ClearState();
    SaveState();
    ResetTrailingState();
 
@@ -2617,6 +2948,7 @@ void UpdateChartComment()
       commentText += "🧭 روند میانی " + TrendTimeframeText(MidTrendTF) + " : " + midTrendStr + "\n";
       string timerStatus = g_EnableStartTimer ? "فعال" : "غیرفعال";
       commentText += "⏲️ تایمر شروع: " + timerStatus + " (" + StringFormat("%02d:%02d", StartTimerHour, StartTimerMinute) + ")\n";
+      commentText += ConsecutiveGridStatusText();
       Comment(commentText);
       return;
      }
@@ -2631,6 +2963,7 @@ void UpdateChartComment()
       commentText += "🧭 روند میانی " + TrendTimeframeText(MidTrendTF) + " : " + midTrendStr + "\n";
       string timerStatus = g_EnableStartTimer ? "فعال" : "غیرفعال";
       commentText += "⏲️ تایمر شروع: " + timerStatus + " (" + StringFormat("%02d:%02d", StartTimerHour, StartTimerMinute) + ")\n";
+      commentText += ConsecutiveGridStatusText();
       Comment(commentText);
       return;
      }
@@ -2697,7 +3030,8 @@ void UpdateChartComment()
                      DoubleToString(g_MaxFloatingPL, 2) + " $  (اوج)\n";
      }
    commentText += "🎯 هدف سود : " + DoubleToString(TotalProfitTarget, 2) + " $   |   حد ضرر: " + DoubleToString(TotalStopLoss, 2) + " $\n";
-   commentText += "⏲️ تایمر شروع: " + (g_EnableStartTimer ? "فعال" : "غیرفعال") + " (" + StringFormat("%02d:%02d", StartTimerHour, StartTimerMinute) + ")\n";
+    commentText += "⏲️ تایمر شروع: " + (g_EnableStartTimer ? "فعال" : "غیرفعال") + " (" + StringFormat("%02d:%02d", StartTimerHour, StartTimerMinute) + ")\n";
+    commentText += ConsecutiveGridStatusText();
    commentText += "⚙️ وضعیت   : " + (isTradingActive ? "فعال" : "غیرفعال") + " | " + (tradingDone ? "پایان یافته" : "در حال اجرا");
 
    Comment(commentText);
@@ -2791,6 +3125,8 @@ void UpdateChartComment()
   //+------------------------------------------------------------------+
 void UpdateCamarillaLabel()
   {
+   if(ObjectFind(0, "ValCamarilla") < 0) return;
+
    ObjectSetString(0, "ValCamarilla", OBJPROP_TEXT,
                    g_EnableCamarillaCheck ? "true" : "false");
    
@@ -2945,17 +3281,20 @@ void CreateCloseButtons()
       ObjectSetInteger(0, n2, OBJPROP_SELECTABLE,   false);
      }
 
-   CreateButton("BtnToggleStartTimer", "تایمر شروع", 130, 250, 120, 24, clrWhite, clrDodgerBlue, 8);
-   if(ObjectFind(0, "ValStartTimer") < 0)
+   if(ShowStartTimerButton)
      {
-      ObjectCreate(0, "ValStartTimer", OBJ_LABEL, 0, 0, 0);
-      ObjectSetInteger(0, "ValStartTimer", OBJPROP_CORNER,    CORNER_RIGHT_UPPER);
-      ObjectSetInteger(0, "ValStartTimer", OBJPROP_XDISTANCE, 280);
-      ObjectSetInteger(0, "ValStartTimer", OBJPROP_YDISTANCE, 250);
-      ObjectSetString (0, "ValStartTimer", OBJPROP_TEXT,      "");
-      ObjectSetInteger(0, "ValStartTimer", OBJPROP_COLOR,     clrYellow);
-      ObjectSetInteger(0, "ValStartTimer", OBJPROP_FONTSIZE,  8);
-      ObjectSetInteger(0, "ValStartTimer", OBJPROP_SELECTABLE, false);
+      CreateButton("BtnToggleStartTimer", "تایمر شروع", 130, 250, 120, 24, clrWhite, clrDodgerBlue, 8);
+      if(ObjectFind(0, "ValStartTimer") < 0)
+        {
+         ObjectCreate(0, "ValStartTimer", OBJ_LABEL, 0, 0, 0);
+         ObjectSetInteger(0, "ValStartTimer", OBJPROP_CORNER,    CORNER_RIGHT_UPPER);
+         ObjectSetInteger(0, "ValStartTimer", OBJPROP_XDISTANCE, 280);
+         ObjectSetInteger(0, "ValStartTimer", OBJPROP_YDISTANCE, 250);
+         ObjectSetString (0, "ValStartTimer", OBJPROP_TEXT,      "");
+         ObjectSetInteger(0, "ValStartTimer", OBJPROP_COLOR,     clrYellow);
+         ObjectSetInteger(0, "ValStartTimer", OBJPROP_FONTSIZE,  8);
+         ObjectSetInteger(0, "ValStartTimer", OBJPROP_SELECTABLE, false);
+        }
      }
 
    string n3 = "BtnFinishGrid";
@@ -3054,40 +3393,43 @@ void CreateLotButtons()
    CreateButton("BtnLotPlus",  "+", 126, 127, 20, 20, clrBlueViolet, clrGreenYellow, 8);
 
    // دکمه تغییر وضعیت Camarilla
-   CreateButton("BtnToggleCamarilla", "حمایت/مقاومت", 126, 151, 120, 20, clrWhite, clrDodgerBlue, 8);
-
-   ObjectCreate(0, "ValCamarilla", OBJ_LABEL, 0, 0, 0);
-   ObjectSetInteger(0, "ValCamarilla", OBJPROP_CORNER,    CORNER_RIGHT_UPPER);
-   ObjectSetInteger(0, "ValCamarilla", OBJPROP_XDISTANCE, 178);
-   ObjectSetInteger(0, "ValCamarilla", OBJPROP_YDISTANCE, 151);
-   ObjectSetString (0, "ValCamarilla", OBJPROP_TEXT,      g_EnableCamarillaCheck ? "true" : "false");
-   ObjectSetInteger(0, "ValCamarilla", OBJPROP_COLOR,     clrYellow);
-   ObjectSetInteger(0, "ValCamarilla", OBJPROP_FONTSIZE,  8);
-
-   // دکمه‌های محدودیت بازه - فقط اگر EnableCamarillaCheck == false
-   if(!EnableCamarillaCheck)
+   if(ShowCamarillaButtons)
      {
-      // دکمه تغییر وضعیت محدودیت بازه کاماریلا
-      CreateButton("BtnToggleCamarillaRange", "حالت بازه", 126, 175, 120, 20, clrWhite, clrMediumPurple, 8);
+      CreateButton("BtnToggleCamarilla", "حمایت/مقاومت", 126, 151, 120, 20, clrWhite, clrDodgerBlue, 8);
 
-      ObjectCreate(0, "ValCamarillaRange", OBJ_LABEL, 0, 0, 0);
-      ObjectSetInteger(0, "ValCamarillaRange", OBJPROP_CORNER,    CORNER_RIGHT_UPPER);
-      ObjectSetInteger(0, "ValCamarillaRange", OBJPROP_XDISTANCE, 178);
-      ObjectSetInteger(0, "ValCamarillaRange", OBJPROP_YDISTANCE, 175);
-      ObjectSetString (0, "ValCamarillaRange", OBJPROP_TEXT,      "H2-L2");
-      ObjectSetInteger(0, "ValCamarillaRange", OBJPROP_COLOR,     clrYellow);
-      ObjectSetInteger(0, "ValCamarillaRange", OBJPROP_FONTSIZE,  8);
-      
-      // دکمه فعال/غیرفعال کردن ویژگی Range Check
-      CreateButton("BtnEnableCamarillaRange", "✓ Range", 126, 199, 120, 20, clrWhite, clrDarkGreen, 8);
-      
-      ObjectCreate(0, "ValRangeEnabled", OBJ_LABEL, 0, 0, 0);
-      ObjectSetInteger(0, "ValRangeEnabled", OBJPROP_CORNER,    CORNER_RIGHT_UPPER);
-      ObjectSetInteger(0, "ValRangeEnabled", OBJPROP_XDISTANCE, 178);
-      ObjectSetInteger(0, "ValRangeEnabled", OBJPROP_YDISTANCE, 199);
-      ObjectSetString (0, "ValRangeEnabled", OBJPROP_TEXT,      g_EnableCamarillaRangeCheck ? "ON" : "OFF");
-      ObjectSetInteger(0, "ValRangeEnabled", OBJPROP_COLOR,     g_EnableCamarillaRangeCheck ? clrLime : clrRed);
-      ObjectSetInteger(0, "ValRangeEnabled", OBJPROP_FONTSIZE,  8);
+      ObjectCreate(0, "ValCamarilla", OBJ_LABEL, 0, 0, 0);
+      ObjectSetInteger(0, "ValCamarilla", OBJPROP_CORNER,    CORNER_RIGHT_UPPER);
+      ObjectSetInteger(0, "ValCamarilla", OBJPROP_XDISTANCE, 178);
+      ObjectSetInteger(0, "ValCamarilla", OBJPROP_YDISTANCE, 151);
+      ObjectSetString (0, "ValCamarilla", OBJPROP_TEXT,      g_EnableCamarillaCheck ? "true" : "false");
+      ObjectSetInteger(0, "ValCamarilla", OBJPROP_COLOR,     clrYellow);
+      ObjectSetInteger(0, "ValCamarilla", OBJPROP_FONTSIZE,  8);
+
+      // دکمه‌های محدودیت بازه - فقط اگر EnableCamarillaCheck == false
+      if(!EnableCamarillaCheck)
+        {
+         // دکمه تغییر وضعیت محدودیت بازه کاماریلا
+         CreateButton("BtnToggleCamarillaRange", "حالت بازه", 126, 175, 120, 20, clrWhite, clrMediumPurple, 8);
+
+         ObjectCreate(0, "ValCamarillaRange", OBJ_LABEL, 0, 0, 0);
+         ObjectSetInteger(0, "ValCamarillaRange", OBJPROP_CORNER,    CORNER_RIGHT_UPPER);
+         ObjectSetInteger(0, "ValCamarillaRange", OBJPROP_XDISTANCE, 178);
+         ObjectSetInteger(0, "ValCamarillaRange", OBJPROP_YDISTANCE, 175);
+         ObjectSetString (0, "ValCamarillaRange", OBJPROP_TEXT,      "H2-L2");
+         ObjectSetInteger(0, "ValCamarillaRange", OBJPROP_COLOR,     clrYellow);
+         ObjectSetInteger(0, "ValCamarillaRange", OBJPROP_FONTSIZE,  8);
+
+         // دکمه فعال/غیرفعال کردن ویژگی Range Check
+         CreateButton("BtnEnableCamarillaRange", "✓ Range", 126, 199, 120, 20, clrWhite, clrDarkGreen, 8);
+
+         ObjectCreate(0, "ValRangeEnabled", OBJ_LABEL, 0, 0, 0);
+         ObjectSetInteger(0, "ValRangeEnabled", OBJPROP_CORNER,    CORNER_RIGHT_UPPER);
+         ObjectSetInteger(0, "ValRangeEnabled", OBJPROP_XDISTANCE, 178);
+         ObjectSetInteger(0, "ValRangeEnabled", OBJPROP_YDISTANCE, 199);
+         ObjectSetString (0, "ValRangeEnabled", OBJPROP_TEXT,      g_EnableCamarillaRangeCheck ? "ON" : "OFF");
+         ObjectSetInteger(0, "ValRangeEnabled", OBJPROP_COLOR,     g_EnableCamarillaRangeCheck ? clrLime : clrRed);
+         ObjectSetInteger(0, "ValRangeEnabled", OBJPROP_FONTSIZE,  8);
+        }
      }
 
    // دکمه‌های TrailingActivation - فقط اگر UseBasketTrailing == true
@@ -3274,11 +3616,11 @@ bool IsPriceWithinCamarillaRange(double price)
    // بررسی اینکه قیمت بین دو سطح است
    if(price >= cachedLower && price <= cachedUpper)
      {
-      PrintFormat("✅ قیمت %.5f درون بازه [%.5f - %.5f]", price, cachedLower, cachedUpper);
+      if(EnableDebugLog) PrintFormat("✅ قیمت %.5f درون بازه [%.5f - %.5f]", price, cachedLower, cachedUpper);
       return true;
      }
    
-   PrintFormat("⛔ قیمت %.5f خارج از بازه [%.5f - %.5f]. سفارش ایجاد نشود.",
+   if(EnableDebugLog) PrintFormat("⛔ قیمت %.5f خارج از بازه [%.5f - %.5f]. سفارش ایجاد نشود.",
                price, cachedLower, cachedUpper);
    return false;
   }
@@ -3315,7 +3657,7 @@ bool IsNearCamarillaLevel(double price, double minDistancePoints)
       double diff = MathAbs(price - levels[i]);
       if(diff < minDist)
         {
-         PrintFormat("⚠️ گسترش متوقف شد: قیمت %.5f به سطح %s (%.5f) نزدیک است (فاصله: %.1f پیپ)",
+         if(EnableDebugLog) PrintFormat("⚠️ گسترش متوقف شد: قیمت %.5f به سطح %s (%.5f) نزدیک است (فاصله: %.1f پیپ)",
                      price, names[i], levels[i], diff / _Point);
          return true;
         }
