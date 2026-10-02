@@ -4,10 +4,10 @@
 //+------------------------------------------------------------------+
 #property copyright "Hamed Movasaqpoor"
 #property link      "hamed.movasaqpoor@gmail.com"
-#property version   "6.19"
+#property version   "6.24"
 
 #include <Trade\Trade.mqh>
-const string EA_VERSION = "6.19";
+const string EA_VERSION = "6.24";
 
 //------------------------- CAMARILLA RANGE MODES -------------------------
 enum CamarillaRangeMode {
@@ -52,8 +52,8 @@ input double TotalProfitTarget = 40.0;     // هدف سود کل (دلار)
 input double TotalStopLoss     = -100.0;    // حد ضرر کل (عدد منفی، دلار)
 
 input bool   EnableStartTimer   = false;    // فعال‌سازی تایمر شروع شبکه
-input int    StartTimerHour     = 2;        // ساعت آغاز شبکه (ساعت محلی)
-input int    StartTimerMinute   = 30;       // دقیقه آغاز شبکه (ساعت محلی)
+input int    StartTimerHour     = 2;        // ساعت آغاز شبکه (ساعت کارگزاری)
+input int    StartTimerMinute   = 30;       // دقیقه آغاز شبکه (ساعت کارگزاری)
 
 input group "=== گسترش شبکه ==="
 input int    InitialMaxBuyExpansions  = 4;
@@ -69,8 +69,6 @@ input int    ConsecutiveGridDelaySec = 60;     // تاخیر بین پایان �
 
 input group "=== نمایش دکمه‌ها ==="
 input bool   ShowCamarillaButtons = false;      // نمایش دکمه‌های حمایت/مقاومت، حالت بازه و Range
-input bool   ShowStartTimerButton = false;      // نمایش دکمه تایمر شروع
-
 
 input group "=== تریلینگ سبد ==="
 input bool   UseBasketTrailing   = false;      // فعال‌سازی تریلینگ حد ضرر کل شبکه
@@ -91,7 +89,6 @@ bool   g_EnableCamarillaCheck = true; // وضعیت قابل تغییر در ز�
 bool   g_EnableCamarillaRangeCheck = true; // محدود کردن سفارشات درون بازه
 CamarillaRangeMode g_CamarillaRange = MODE_H2_L2; // متغیر قابل تغییر برای حالت بازه
 double g_TrailingActivation = 5.0; // مقدار فعال‌سازی تریلینگ قابل تغییر
-bool   g_EnableStartTimer = false; // وضعیت تایمر شروع شبکه
 bool   g_EnableConsecutiveGrids = false; // وضعیت شبکه‌های متوالی (قابل تغییر با دکمه)
 datetime g_LastTimerTriggeredDate = 0; // آخرین تاریخ/زمان اجرای تایمر
 CTrade GridTrade;
@@ -160,6 +157,21 @@ double g_MinFloatingPL = 0.0;  // کمترین سود شناور (بیشترین
 double g_MaxFloatingPL = 0.0;  // بیشترین سود شناور (اوج سود)
 bool   g_FloatingExtremesInited = false; // آیا مقدار اولیه دریافت شده؟
 
+// --- پذیرش معاملات موجود بعد از قطع شدن متاتریدر ---
+bool     g_AdoptionActive = false;
+datetime g_AdoptionTime   = 0;
+double   g_SessionCarryProfit = 0.0; // سود بسته‌شده‌ای که شماره جادویی‌اش داخل بازه زنجیره نیست
+ulong    g_AdoptedPositionIds[];
+ulong    g_AdoptedOrderTickets[];
+
+void SaveAdoptionFile();
+void LoadAdoptionFile();
+void ClearAdoption();
+bool IsManagedPosition();
+bool IsManagedOrder();
+double CalculateAdoptionOutsideOpenProfit();
+double CalculateAdoptionOutsideClosedProfit();
+
 
 struct CamarillaLevels
   {
@@ -196,7 +208,6 @@ void SaveState()
    GlobalVariableSet(GVarName("EnableCamarillaRangeCheck"), g_EnableCamarillaRangeCheck ? 1.0 : 0.0);
    GlobalVariableSet(GVarName("g_CamarillaRange"), (double)g_CamarillaRange);
    GlobalVariableSet(GVarName("TrailingActivation"), g_TrailingActivation);
-   GlobalVariableSet(GVarName("EnableStartTimer"), g_EnableStartTimer ? 1.0 : 0.0);
    GlobalVariableSet(GVarName("g_LastTimerTriggeredDate"), (double)g_LastTimerTriggeredDate);
    GlobalVariableSet(GVarName("g_SymmetricMode"), g_SymmetricMode ? 1.0 : 0.0);
    GlobalVariableSet(GVarName("g_MinFloatingPL"), g_MinFloatingPL);
@@ -210,6 +221,10 @@ void SaveState()
    GlobalVariableSet(GVarName("g_SessionStartTime"), (double)g_SessionStartTime);
    GlobalVariableSet(GVarName("g_SessionGridCount"), (double)g_SessionGridCount);
    GlobalVariableSet(GVarName("g_SessionClosedCount"), (double)g_SessionClosedCount);
+   GlobalVariableSet(GVarName("g_AdoptionActive"), g_AdoptionActive ? 1.0 : 0.0);
+   GlobalVariableSet(GVarName("g_AdoptionTime"), (double)g_AdoptionTime);
+   GlobalVariableSet(GVarName("g_SessionCarryProfit"), g_SessionCarryProfit);
+   SaveAdoptionFile();
    if(EnableDebugLog) Print("📌 EA state saved to GlobalVariables.");
   }
 
@@ -245,9 +260,7 @@ bool LoadState()
    g_TrailingActivation = GlobalVariableCheck(GVarName("TrailingActivation"))
                           ? GlobalVariableGet(GVarName("TrailingActivation"))
                           : TrailingActivation;
-   g_EnableStartTimer = GlobalVariableCheck(GVarName("EnableStartTimer"))
-                          ? (GlobalVariableGet(GVarName("EnableStartTimer")) >= 0.5)
-                          : EnableStartTimer;
+   GlobalVariableDel(GVarName("EnableStartTimer"));
    g_LastTimerTriggeredDate = GlobalVariableCheck(GVarName("g_LastTimerTriggeredDate"))
                           ? (datetime)GlobalVariableGet(GVarName("g_LastTimerTriggeredDate"))
                           : 0;
@@ -282,7 +295,13 @@ bool LoadState()
    g_SessionClosedCount = GlobalVariableCheck(GVarName("g_SessionClosedCount"))
                           ? (int)GlobalVariableGet(GVarName("g_SessionClosedCount")) : 0;
 
-
+   g_AdoptionActive = GlobalVariableCheck(GVarName("g_AdoptionActive"))
+                      ? (GlobalVariableGet(GVarName("g_AdoptionActive")) >= 0.5) : false;
+   g_AdoptionTime = GlobalVariableCheck(GVarName("g_AdoptionTime"))
+                    ? (datetime)GlobalVariableGet(GVarName("g_AdoptionTime")) : 0;
+   g_SessionCarryProfit = GlobalVariableCheck(GVarName("g_SessionCarryProfit"))
+                          ? GlobalVariableGet(GVarName("g_SessionCarryProfit")) : 0.0;
+   LoadAdoptionFile();
 
    g_CurrentLot = NormalizeLotVolume(g_CurrentLot);
 
@@ -294,10 +313,251 @@ bool LoadState()
 
 void ClearState()
   {
+   if(g_AdoptionActive && g_SessionStarted)
+      g_SessionCarryProfit += CalculateAdoptionOutsideOpenProfit() + CalculateAdoptionOutsideClosedProfit();
+   ClearAdoption();
+
    string prefix = "GridHedge~" + _Symbol + "~" + IntegerToString(MagicNumber) + "~";
-   string names[] = {"inited","g_GridInstance","g_ActiveMagic","isTradingActive","tradingDone","buyExpansionCount","sellExpansionCount","lastBuyPosCount","lastSellPosCount","lastBuyExpansionPrice","lastSellExpansionPrice","g_MaxBuyExpansions","g_MaxSellExpansions","g_ActualGridStep","g_CurrentLot","g_OrderCommentSeq","EnableCamarillaCheck","EnableCamarillaRangeCheck","g_CamarillaRange","TrailingActivation","EnableStartTimer","g_LastTimerTriggeredDate","g_SymmetricMode", "g_MinFloatingPL","g_MaxFloatingPL","g_FloatingExtremesInited","g_NextGridStartTime","g_EnableConsecutiveGrids","g_SessionStarted","g_SessionActive","g_SessionStartMagic","g_SessionStartTime","g_SessionGridCount","g_SessionClosedCount"};
+   string names[] = {"inited","g_GridInstance","g_ActiveMagic","isTradingActive","tradingDone","buyExpansionCount","sellExpansionCount","lastBuyPosCount","lastSellPosCount","lastBuyExpansionPrice","lastSellExpansionPrice","g_MaxBuyExpansions","g_MaxSellExpansions","g_ActualGridStep","g_CurrentLot","g_OrderCommentSeq","EnableCamarillaCheck","EnableCamarillaRangeCheck","g_CamarillaRange","TrailingActivation","EnableStartTimer","g_LastTimerTriggeredDate","g_SymmetricMode", "g_MinFloatingPL","g_MaxFloatingPL","g_FloatingExtremesInited","g_NextGridStartTime","g_EnableConsecutiveGrids","g_SessionStarted","g_SessionActive","g_SessionStartMagic","g_SessionStartTime","g_SessionGridCount","g_SessionClosedCount","g_AdoptionActive","g_AdoptionTime","g_SessionCarryProfit"};
    for(int i=0;i<ArraySize(names);i++) GlobalVariableDel(prefix + names[i]);
    if(EnableDebugLog) Print("📌 Cleared persisted EA state.");
+  }
+
+//+------------------------------------------------------------------+
+//| فهرست پوزیشن و سفارش پذیرفته‌شده                                |
+//+------------------------------------------------------------------+
+bool IdInList(const ulong &ids[], ulong id)
+  {
+   if(id == 0) return false;
+   int n = ArraySize(ids);
+   for(int i = 0; i < n; i++)
+      if(ids[i] == id) return true;
+   return false;
+  }
+
+void AddUniqueId(ulong &ids[], ulong id)
+  {
+   if(id == 0 || IdInList(ids, id)) return;
+   int n = ArraySize(ids);
+   ArrayResize(ids, n + 1);
+   ids[n] = id;
+  }
+
+void RemoveId(ulong &ids[], ulong id)
+  {
+   int n = ArraySize(ids);
+   for(int i = 0; i < n; i++)
+     {
+      if(ids[i] != id) continue;
+      for(int j = i; j < n - 1; j++)
+         ids[j] = ids[j + 1];
+      ArrayResize(ids, n - 1);
+      return;
+     }
+  }
+
+string AdoptionFileName()
+  {
+   string sym = _Symbol;
+   StringReplace(sym, "\\", "_");
+   StringReplace(sym, "/", "_");
+   StringReplace(sym, ":", "_");
+   StringReplace(sym, "*", "_");
+   StringReplace(sym, "?", "_");
+   StringReplace(sym, "\"", "_");
+   StringReplace(sym, "<", "_");
+   StringReplace(sym, ">", "_");
+   StringReplace(sym, "|", "_");
+   StringReplace(sym, ".", "_");
+   return "GridHedge_Adopt_" + sym + "_" + IntegerToString(MagicNumber) + ".txt";
+  }
+
+void ClearAdoption()
+  {
+   g_AdoptionActive = false;
+   g_AdoptionTime = 0;
+   ArrayResize(g_AdoptedPositionIds, 0);
+   ArrayResize(g_AdoptedOrderTickets, 0);
+   string name = AdoptionFileName();
+   if(FileIsExist(name)) FileDelete(name);
+  }
+
+void SaveAdoptionFile()
+  {
+   string name = AdoptionFileName();
+   if(!g_AdoptionActive)
+     {
+      if(FileIsExist(name)) FileDelete(name);
+      return;
+     }
+
+   int handle = FileOpen(name, FILE_WRITE|FILE_TXT|FILE_ANSI);
+   if(handle == INVALID_HANDLE)
+     {
+      Print("❌ ذخیره فهرست پذیرش ناموفق: ", GetLastError());
+      return;
+     }
+
+   FileWrite(handle, "time=" + IntegerToString((long)g_AdoptionTime));
+   for(int i = 0; i < ArraySize(g_AdoptedPositionIds); i++)
+      FileWrite(handle, "pos=" + StringFormat("%I64u", g_AdoptedPositionIds[i]));
+   for(int i = 0; i < ArraySize(g_AdoptedOrderTickets); i++)
+      FileWrite(handle, "ord=" + StringFormat("%I64u", g_AdoptedOrderTickets[i]));
+   FileClose(handle);
+  }
+
+void LoadAdoptionFile()
+  {
+   ArrayResize(g_AdoptedPositionIds, 0);
+   ArrayResize(g_AdoptedOrderTickets, 0);
+   if(!g_AdoptionActive) return;
+
+   string name = AdoptionFileName();
+   if(!FileIsExist(name))
+     {
+      g_AdoptionActive = false;
+      g_AdoptionTime = 0;
+      Print("⚠️ فهرست پذیرش پیدا نشد؛ حالت پذیرش خاموش شد.");
+      return;
+     }
+
+   int handle = FileOpen(name, FILE_READ|FILE_TXT|FILE_ANSI);
+   if(handle == INVALID_HANDLE)
+     {
+      g_AdoptionActive = false;
+      g_AdoptionTime = 0;
+      Print("❌ خواندن فهرست پذیرش ناموفق: ", GetLastError());
+      return;
+     }
+
+   while(!FileIsEnding(handle))
+     {
+      string line = FileReadString(handle);
+      StringTrimLeft(line);
+      StringTrimRight(line);
+      if(StringFind(line, "time=") == 0)
+         g_AdoptionTime = (datetime)StringToInteger(StringSubstr(line, 5));
+      else if(StringFind(line, "pos=") == 0)
+         AddUniqueId(g_AdoptedPositionIds, (ulong)StringToInteger(StringSubstr(line, 4)));
+      else if(StringFind(line, "ord=") == 0)
+         AddUniqueId(g_AdoptedOrderTickets, (ulong)StringToInteger(StringSubstr(line, 4)));
+     }
+   FileClose(handle);
+  }
+
+bool IsManagedPosition()
+  {
+   if(PositionGetString(POSITION_SYMBOL) != _Symbol) return false;
+   if((int)PositionGetInteger(POSITION_MAGIC) == g_ActiveMagic) return true;
+   if(!g_AdoptionActive) return false;
+   return IdInList(g_AdoptedPositionIds, (ulong)PositionGetInteger(POSITION_IDENTIFIER));
+  }
+
+bool IsManagedOrder()
+  {
+   if(OrderGetString(ORDER_SYMBOL) != _Symbol) return false;
+   if((int)OrderGetInteger(ORDER_MAGIC) == g_ActiveMagic) return true;
+   if(!g_AdoptionActive) return false;
+   return IdInList(g_AdoptedOrderTickets, (ulong)OrderGetInteger(ORDER_TICKET));
+  }
+
+bool MagicBelongsToSession(long magic)
+  {
+   if(!g_SessionStarted) return false;
+   if(g_ActiveMagic < g_SessionStartMagic) return false;
+   return (magic >= g_SessionStartMagic && magic <= g_ActiveMagic);
+  }
+
+double DealMoney(ulong dealTicket)
+  {
+   return HistoryDealGetDouble(dealTicket, DEAL_PROFIT)
+        + HistoryDealGetDouble(dealTicket, DEAL_SWAP)
+        + HistoryDealGetDouble(dealTicket, DEAL_COMMISSION)
+        + HistoryDealGetDouble(dealTicket, DEAL_FEE);
+  }
+
+bool IsClosingDeal(ulong dealTicket)
+  {
+   long dealType = HistoryDealGetInteger(dealTicket, DEAL_TYPE);
+   if(dealType != DEAL_TYPE_BUY && dealType != DEAL_TYPE_SELL) return false;
+   long entryType = HistoryDealGetInteger(dealTicket, DEAL_ENTRY);
+   return (entryType == DEAL_ENTRY_OUT ||
+           entryType == DEAL_ENTRY_INOUT ||
+           entryType == DEAL_ENTRY_OUT_BY);
+  }
+
+double CalculateAdoptionOutsideOpenProfit()
+  {
+   if(!g_AdoptionActive) return 0.0;
+   double profit = 0.0;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+     {
+      ulong ticket = PositionGetTicket(i);
+      if(!PositionSelectByTicket(ticket)) continue;
+      if(!IsManagedPosition()) continue;
+      long magic = PositionGetInteger(POSITION_MAGIC);
+      if(magic == g_ActiveMagic || MagicBelongsToSession(magic)) continue;
+      profit += PositionGetDouble(POSITION_PROFIT);
+     }
+   return profit;
+  }
+
+double CalculateAdoptionOutsideClosedProfit()
+  {
+   if(!g_AdoptionActive || g_AdoptionTime <= 0) return 0.0;
+   if(!HistorySelect(g_AdoptionTime, TimeCurrent())) return 0.0;
+
+   double profit = 0.0;
+   int totalDeals = HistoryDealsTotal();
+   for(int i = 0; i < totalDeals; i++)
+     {
+      ulong dealTicket = HistoryDealGetTicket(i);
+      if(dealTicket == 0) continue;
+      if(HistoryDealGetString(dealTicket, DEAL_SYMBOL) != _Symbol) continue;
+      if(!IsClosingDeal(dealTicket)) continue;
+      if((datetime)HistoryDealGetInteger(dealTicket, DEAL_TIME) < g_AdoptionTime) continue;
+
+      ulong positionId = (ulong)HistoryDealGetInteger(dealTicket, DEAL_POSITION_ID);
+      if(!IdInList(g_AdoptedPositionIds, positionId)) continue;
+
+      long magic = HistoryDealGetInteger(dealTicket, DEAL_MAGIC);
+      if(magic == g_ActiveMagic || MagicBelongsToSession(magic)) continue;
+      profit += DealMoney(dealTicket);
+     }
+   return profit;
+  }
+
+//+------------------------------------------------------------------+
+//| اگر سفارش پذیرفته‌شده پر شده باشد، پوزیشن جدید را هم عضو شبکه کن |
+//+------------------------------------------------------------------+
+void PromoteFilledAdoptedOrders()
+  {
+   if(!g_AdoptionActive || g_AdoptionTime <= 0) return;
+   if(ArraySize(g_AdoptedOrderTickets) == 0) return;
+   if(!HistorySelect(g_AdoptionTime, TimeCurrent())) return;
+
+   bool changed = false;
+   int totalDeals = HistoryDealsTotal();
+   for(int i = 0; i < totalDeals; i++)
+     {
+      ulong dealTicket = HistoryDealGetTicket(i);
+      if(dealTicket == 0) continue;
+      if(HistoryDealGetString(dealTicket, DEAL_SYMBOL) != _Symbol) continue;
+      if(HistoryDealGetInteger(dealTicket, DEAL_ENTRY) != DEAL_ENTRY_IN) continue;
+
+      ulong orderTicket = (ulong)HistoryDealGetInteger(dealTicket, DEAL_ORDER);
+      if(!IdInList(g_AdoptedOrderTickets, orderTicket)) continue;
+
+      ulong positionId = (ulong)HistoryDealGetInteger(dealTicket, DEAL_POSITION_ID);
+      AddUniqueId(g_AdoptedPositionIds, positionId);
+      RemoveId(g_AdoptedOrderTickets, orderTicket);
+      changed = true;
+     }
+
+   if(changed)
+     {
+      SaveAdoptionFile();
+     }
   }
 
 void PrepareGridCommentContext()
@@ -557,8 +817,7 @@ bool SelectPositionByTicketOrIdentifier(ulong positionId)
 void SyncPositionProtectionToOpenPrice(ulong positionTicket)
   {
    if(!SelectPositionByTicketOrIdentifier(positionTicket)) return;
-   if(PositionGetInteger(POSITION_MAGIC) != g_ActiveMagic) return;
-   if(PositionGetString(POSITION_SYMBOL) != _Symbol) return;
+   if(!IsManagedPosition()) return;
 
    ulong ticket = (ulong)PositionGetInteger(POSITION_TICKET);
    long posType = PositionGetInteger(POSITION_TYPE);
@@ -611,7 +870,6 @@ int OnInit()
       g_EnableCamarillaRangeCheck = EnableCamarillaRangeCheck;
       g_CamarillaRange = CamarillaRange;
       g_TrailingActivation = TrailingActivation;
-       g_EnableStartTimer = EnableStartTimer;
        g_EnableConsecutiveGrids = EnableConsecutiveGrids;
        g_LastTimerTriggeredDate = 0;
     }
@@ -630,7 +888,7 @@ int OnInit()
       CreateExpansionButtons();    // دکمه‌های ± خرید و فروش
       CreateLotButtons();
        CreateStartButton();         // «شروع شبکه»
-       UpdateStartTimerLabel();
+       CreateAdoptButton();         // «پذیرش معاملات»
        CreateConsecutiveGridsButton(); // دکمه فعال/غیرفعال شبکه‌های متوالی
 
       bool gridExists = AnyGridExists();
@@ -647,6 +905,7 @@ int OnInit()
       UpdateExpansionLabels();
       UpdateLotLabel();
       UpdateChartComment();
+      EventSetTimer(1);   // ساعت و شمارش معکوس تایمر بدون تیک هم به‌روز شوند
 
       if(!isTradingActive)
          Print("منتظر کلیک روی دکمه «شروع شبکه» باشید...");
@@ -668,14 +927,24 @@ int OnInit()
    return INIT_SUCCEEDED;
   }
 //+------------------------------------------------------------------+
+//| OnTimer: فقط به‌روزرسانی باکس اطلاعات                            |
+//+------------------------------------------------------------------+
+void OnTimer()
+  {
+   UpdateChartComment();
+  }
+
+//+------------------------------------------------------------------+
 //| OnDeinit                                                         |
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
   {
+   EventKillTimer();
    // قبل از پاک‌سازی رابط، وضعیت را ذخیره کن تا تغییر تایم‌فریم باعث ریست تنظیمات نشود
    SaveState();
 
    ObjectDelete(0, "BtnStartGrid");
+   ObjectDelete(0, "BtnAdoptTrades");
    ObjectDelete(0, "BtnCloseProfitable");
    ObjectDelete(0, "BtnCloseAllGrid");
    ObjectsDeleteAll(0, "BtnBuyExp");
@@ -689,8 +958,6 @@ void OnDeinit(const int reason)
    ObjectDelete(0, "ValLot");
    ObjectDelete(0, "BtnLotMinus");
    ObjectDelete(0, "BtnLotPlus");
-   ObjectDelete(0, "BtnToggleStartTimer");
-   ObjectDelete(0, "ValStartTimer");
    ObjectDelete(0, "BtnToggleConsecutive");
    ObjectDelete(0, "BtnToggleCamarilla");
    ObjectDelete(0, "LblCamarilla");
@@ -703,6 +970,7 @@ void OnDeinit(const int reason)
    ObjectDelete(0, "BtnTrailingActivationMinus");
    ObjectDelete(0, "ValTrailingActivation");
    ObjectDelete(0, "LblTrailingActivation");
+   DeleteInfoPanel();
    Comment("");
 
    ObjectsDeleteAll(0, "Camarilla_");
@@ -721,21 +989,34 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
 
    if(!HistoryDealSelect(trans.deal))
       return;
-
-   if(HistoryDealGetInteger(trans.deal, DEAL_MAGIC) != g_ActiveMagic)
-      return;
    if(HistoryDealGetString(trans.deal, DEAL_SYMBOL) != _Symbol)
-      return;
-   if(HistoryDealGetInteger(trans.deal, DEAL_ENTRY) != DEAL_ENTRY_IN)
       return;
 
    long dealType = HistoryDealGetInteger(trans.deal, DEAL_TYPE);
    if(dealType != DEAL_TYPE_BUY && dealType != DEAL_TYPE_SELL)
       return;
 
-   ulong positionTicket = (ulong)HistoryDealGetInteger(trans.deal, DEAL_POSITION_ID);
-   if(positionTicket > 0)
-      SyncPositionProtectionToOpenPrice(positionTicket);
+   long magic = HistoryDealGetInteger(trans.deal, DEAL_MAGIC);
+   long entry = HistoryDealGetInteger(trans.deal, DEAL_ENTRY);
+   ulong orderTicket = (ulong)HistoryDealGetInteger(trans.deal, DEAL_ORDER);
+   ulong positionId = (ulong)HistoryDealGetInteger(trans.deal, DEAL_POSITION_ID);
+
+   bool adoptedOrder = (g_AdoptionActive && IdInList(g_AdoptedOrderTickets, orderTicket));
+   if(adoptedOrder && entry == DEAL_ENTRY_IN && positionId > 0)
+     {
+      AddUniqueId(g_AdoptedPositionIds, positionId);
+      RemoveId(g_AdoptedOrderTickets, orderTicket);
+      SaveAdoptionFile();
+     }
+
+   if(entry != DEAL_ENTRY_IN)
+      return;
+   if(magic != g_ActiveMagic && !adoptedOrder &&
+      !(g_AdoptionActive && IdInList(g_AdoptedPositionIds, positionId)))
+      return;
+
+   if(positionId > 0)
+      SyncPositionProtectionToOpenPrice(positionId);
   }
 
 //+------------------------------------------------------------------+
@@ -769,6 +1050,9 @@ void OnTick()
         }
       else return; // همچنان منتظر
      }
+
+   if(g_AdoptionActive)
+      PromoteFilledAdoptedOrders();
 
    if(!isTradingActive || tradingDone)
      {
@@ -857,7 +1141,7 @@ void UpdateFloatingExtremes()
 //+------------------------------------------------------------------+
 bool CheckStartTimer()
   {
-  if(!g_EnableStartTimer) return false;
+  if(!EnableStartTimer) return false;
   if(isTradingActive) return false;
 
   MqlDateTime market;
@@ -883,29 +1167,48 @@ bool CheckStartTimer()
   return true;
   }
 
-//+------------------------------------------------------------------+
-//| تغییر وضعیت تایمر شروع                                            |
-//+------------------------------------------------------------------+
-void ToggleStartTimer()
+string FormatDuration(int seconds)
   {
-  g_EnableStartTimer = !g_EnableStartTimer;
-  UpdateStartTimerLabel();
-  SaveState();
-  PrintFormat("⏱️ تایمر شروع %s شد.", g_EnableStartTimer ? "فعال" : "غیرفعال");
+   if(seconds < 0) seconds = 0;
+   int h = seconds / 3600;
+   int m = (seconds % 3600) / 60;
+   int s = seconds % 60;
+   return StringFormat("%d:%02d:%02d", h, m, s);
   }
 
 //+------------------------------------------------------------------+
-//| بروزرسانی برچسب وضعیت تایمر روی چارت                             |
+//| متن وضعیت تایمر شروع برای باکس اطلاعات (بر اساس ساعت کارگزاری) |
 //+------------------------------------------------------------------+
-void UpdateStartTimerLabel()
+string StartTimerStatusText()
   {
-   if(ObjectFind(0, "ValStartTimer") < 0) return;
-   string status = g_EnableStartTimer ? "ON" : "OFF";
-   string timeText = StringFormat("%02d:%02d", StartTimerHour, StartTimerMinute);
-   ObjectSetString(0, "ValStartTimer", OBJPROP_TEXT,
-                   "تایمر: " + status + " " + timeText);
-   ObjectSetInteger(0, "ValStartTimer", OBJPROP_COLOR,
-                    g_EnableStartTimer ? clrLime : clrRed);
+   datetime now = TimeTradeServer();
+   if(now <= 0) now = TimeCurrent();
+   string text = "⏲️ تایمر شروع: " + (EnableStartTimer ? "فعال" : "غیرفعال") +
+                 " (" + StringFormat("%02d:%02d", StartTimerHour, StartTimerMinute) + ")" +
+                 " | ساعت کارگزاری: " + TimeToString(now, TIME_SECONDS) + "\n";
+   if(!EnableStartTimer)
+      return text;
+
+   MqlDateTime t;
+   TimeToStruct(now, t);
+   t.hour = StartTimerHour;
+   t.min  = StartTimerMinute;
+   t.sec  = 0;
+   datetime target = StructToTime(t);
+
+   if(now >= target && g_LastTimerTriggeredDate != target)
+     {
+      text += isTradingActive
+              ? "⏳ زمان تایمر رسیده؛ بعد از پایان شبکه فعلی اجرا می‌شود\n"
+              : "⏳ زمان تایمر رسیده؛ با تیک بعدی اجرا می‌شود\n";
+      return text;
+     }
+   if(now >= target)
+      target += 86400;
+
+   text += "⏳ تا شروع تایمر: " + FormatDuration((int)(target - now)) +
+           (isTradingActive ? " (اگر شبکه فعال باشد اجرا نمی‌شود)" : "") + "\n";
+   return text;
   }
 
 //+------------------------------------------------------------------+
@@ -915,10 +1218,10 @@ void OnChartEvent(const int id, const long &lparam, const double &dparam, const 
   {
    if(id != CHARTEVENT_OBJECT_CLICK) return;
 
-   if(sparam == "BtnStartGrid")        { StartGridByButton();   return; }
+   if(sparam == "BtnStartGrid")        { ObjectSetInteger(0, sparam, OBJPROP_STATE, false); StartGridByButton(); return; }
+   if(sparam == "BtnAdoptTrades")      { ObjectSetInteger(0, sparam, OBJPROP_STATE, false); AdoptOpenTrades(); return; }
    if(sparam == "BtnCloseProfitable")  { CloseProfitableGrid(); return; }
    if(sparam == "BtnCloseAllGrid")     { CloseAllGrid();        return; }
-   if(sparam == "BtnToggleStartTimer") { ToggleStartTimer();    return; }
    if(sparam == "BtnToggleConsecutive") { ToggleConsecutiveGrids(); return; }
    if(sparam == "BtnFinishGrid")        { FinalizeGrid();          return; }
 
@@ -1120,7 +1423,7 @@ double CalculateSessionProfit()
    if(!g_SessionStarted)
       return 0.0;
    if(g_ActiveMagic < g_SessionStartMagic)
-      return 0.0;
+      return g_SessionCarryProfit;
 
    int startMagic = g_SessionStartMagic;
    int endMagic   = g_ActiveMagic;
@@ -1167,6 +1470,9 @@ double CalculateSessionProfit()
       profit += HistoryDealGetDouble(deal, DEAL_FEE);
      }
 
+   profit += g_SessionCarryProfit;
+   if(g_AdoptionActive)
+      profit += CalculateAdoptionOutsideOpenProfit() + CalculateAdoptionOutsideClosedProfit();
    return profit;
   }
 
@@ -1185,6 +1491,7 @@ void BeginConsecutiveSession()
    g_SessionStartTime   = TimeCurrent();
    g_SessionGridCount   = 0;
    g_SessionClosedCount = 0;
+   g_SessionCarryProfit = 0.0;
    PrintFormat("🔗 زنجیره جدید شبکه‌های متوالی آغاز شد | Magic=%d | زمان=%s",
                g_SessionStartMagic, TimeToString(g_SessionStartTime, TIME_DATE|TIME_SECONDS));
   }
@@ -1265,6 +1572,104 @@ void CreateConsecutiveGridsButton()
   }
 
 //+------------------------------------------------------------------+
+//| پذیرش پوزیشن‌ها و سفارش‌های معلق فعلی نماد به‌عنوان یک شبکه       |
+//+------------------------------------------------------------------+
+void AdoptOpenTrades()
+  {
+   if(isTradingActive && !tradingDone)
+     {
+      Print("⚠️ شبکه الان فعال است. پذیرش برای وقتی است که ربات مدیریت معاملات را از دست داده باشد.");
+      return;
+     }
+
+   ulong posIds[];
+   ulong ordIds[];
+   int buyPos = 0, sellPos = 0, buyOrd = 0, sellOrd = 0;
+
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+     {
+      ulong ticket = PositionGetTicket(i);
+      if(!PositionSelectByTicket(ticket)) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+
+      AddUniqueId(posIds, (ulong)PositionGetInteger(POSITION_IDENTIFIER));
+      if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY) buyPos++;
+      else sellPos++;
+     }
+
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+     {
+      ulong ticket = OrderGetTicket(i);
+      if(!OrderSelect(ticket)) continue;
+      if(OrderGetString(ORDER_SYMBOL) != _Symbol) continue;
+
+      AddUniqueId(ordIds, ticket);
+      ENUM_ORDER_TYPE type = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
+      if(type == ORDER_TYPE_BUY_STOP || type == ORDER_TYPE_BUY_LIMIT || type == ORDER_TYPE_BUY)
+         buyOrd++;
+      else
+         sellOrd++;
+     }
+
+   if(ArraySize(posIds) == 0 && ArraySize(ordIds) == 0)
+     {
+      Print("⚠️ روی این نماد پوزیشن یا سفارش معلقی برای پذیرش وجود ندارد.");
+      return;
+     }
+
+   g_GridInstance++;
+   g_ActiveMagic = MagicNumber + g_GridInstance;
+   BeginConsecutiveSession();
+   g_SessionGridCount++;
+
+   g_AdoptionActive = true;
+   g_AdoptionTime = TimeCurrent();
+   ArrayResize(g_AdoptedPositionIds, 0);
+   ArrayResize(g_AdoptedOrderTickets, 0);
+   for(int i = 0; i < ArraySize(posIds); i++)
+      AddUniqueId(g_AdoptedPositionIds, posIds[i]);
+   for(int i = 0; i < ArraySize(ordIds); i++)
+      AddUniqueId(g_AdoptedOrderTickets, ordIds[i]);
+
+   bool hasBuy = (buyPos + buyOrd) > 0;
+   bool hasSell = (sellPos + sellOrd) > 0;
+   g_SymmetricMode = (hasBuy && hasSell);
+   if(g_SymmetricMode)
+      g_GridDirection = -1;
+   else if(hasBuy)
+      g_GridDirection = ORDER_TYPE_BUY;
+   else
+      g_GridDirection = ORDER_TYPE_SELL;
+
+   g_NextGridStartTime = 0;
+   g_WaitingForMarketOpen = false;
+   isTradingActive = true;
+   tradingDone = false;
+   buyExpansionCount = 0;
+   sellExpansionCount = 0;
+   PrepareGridCommentContext();
+
+   lastBuyExpansionPrice = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   lastSellExpansionPrice = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   lastBuyPosCount = CountPositionsByType(POSITION_TYPE_BUY);
+   lastSellPosCount = CountPositionsByType(POSITION_TYPE_SELL);
+
+   ResetTrailingState();
+   ResetFloatingExtremes();
+   SaveAdoptionFile();
+   SaveState();
+   UpdateExpansionLabels();
+   UpdateChartComment();
+
+   PrintFormat("📥 پذیرش انجام شد | پوزیشن: %d (خرید %d / فروش %d) | سفارش معلق: %d | Magic سفارش‌های جدید: %d",
+               buyPos + sellPos, buyPos, sellPos, buyOrd + sellOrd, g_ActiveMagic);
+
+   CheckTotalProfitLoss();
+   if(isTradingActive && !tradingDone && UseBasketTrailing)
+      CheckBasketTrailingStop();
+  }
+
+//+------------------------------------------------------------------+
 //| شروع شبکه؛ continueSession=true یعنی ادامه زنجیره متوالی فعلی      |
 //+------------------------------------------------------------------+
 void StartGridByButton(bool continueSession = false)
@@ -1274,6 +1679,9 @@ void StartGridByButton(bool continueSession = false)
       Print("⚠️ شبکه در حال حاضر فعال است. ابتدا آن را ببندید.");
       return;
      }
+   if(g_AdoptionActive && g_SessionStarted)
+      g_SessionCarryProfit += CalculateAdoptionOutsideOpenProfit() + CalculateAdoptionOutsideClosedProfit();
+   ClearAdoption();
    Print("▶ ایجاد شبکه جدید...");
 
    // شروع دستی همیشه زنجیره تازه‌ای می‌سازد؛ شروع خودکار زنجیره را ادامه می‌دهد
@@ -1314,17 +1722,13 @@ bool AnyGridExists()
    for(int i = PositionsTotal() - 1; i >= 0; i--)
      {
       ulong t = PositionGetTicket(i);
-      if(PositionSelectByTicket(t) &&
-         PositionGetInteger(POSITION_MAGIC) == g_ActiveMagic &&   // <-- تغییر
-         PositionGetString(POSITION_SYMBOL) == _Symbol)
+      if(PositionSelectByTicket(t) && IsManagedPosition())
          return true;
      }
    for(int i = OrdersTotal() - 1; i >= 0; i--)
      {
       ulong t = OrderGetTicket(i);
-      if(OrderSelect(t) &&
-         OrderGetInteger(ORDER_MAGIC) == g_ActiveMagic &&        // <-- تغییر
-         OrderGetString(ORDER_SYMBOL) == _Symbol)
+      if(OrderSelect(t) && IsManagedOrder())
          return true;
      }
    return false;
@@ -1986,8 +2390,7 @@ bool IsTooCloseToExisting(double price, ENUM_ORDER_TYPE orderType)
      {
       ulong ticket = OrderGetTicket(i);
       if(!OrderSelect(ticket)) continue;
-      if(OrderGetInteger(ORDER_MAGIC) != g_ActiveMagic) continue;
-      if(OrderGetString(ORDER_SYMBOL) != _Symbol) continue;
+      if(!IsManagedOrder()) continue;
       if(OrderGetInteger(ORDER_TYPE) != orderType) continue;
       
       double existingPrice = OrderGetDouble(ORDER_PRICE_OPEN);
@@ -2005,8 +2408,7 @@ bool IsTooCloseToExisting(double price, ENUM_ORDER_TYPE orderType)
      {
       ulong ticket = PositionGetTicket(i);
       if(!PositionSelectByTicket(ticket)) continue;
-      if(PositionGetInteger(POSITION_MAGIC) != g_ActiveMagic) continue;
-      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      if(!IsManagedPosition()) continue;
       if(PositionGetInteger(POSITION_TYPE) != posType) continue;
       
       double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
@@ -2106,8 +2508,7 @@ double FindHighestBuyStopPrice()
      {
       ulong t = OrderGetTicket(i);
       if(OrderSelect(t) &&
-         OrderGetInteger(ORDER_MAGIC) == g_ActiveMagic &&
-         OrderGetString(ORDER_SYMBOL) == _Symbol &&
+         IsManagedOrder() &&
          OrderGetInteger(ORDER_TYPE)  == ORDER_TYPE_BUY_STOP)
         {
          double p = OrderGetDouble(ORDER_PRICE_OPEN);
@@ -2124,8 +2525,7 @@ double FindLowestSellStopPrice()
      {
       ulong t = OrderGetTicket(i);
       if(OrderSelect(t) &&
-         OrderGetInteger(ORDER_MAGIC) == g_ActiveMagic &&
-         OrderGetString(ORDER_SYMBOL) == _Symbol &&
+         IsManagedOrder() &&
          OrderGetInteger(ORDER_TYPE)  == ORDER_TYPE_SELL_STOP)
         {
          double p = OrderGetDouble(ORDER_PRICE_OPEN);
@@ -2145,8 +2545,7 @@ int CountPositionsByType(long type)
      {
       ulong t = PositionGetTicket(i);
       if(PositionSelectByTicket(t) &&
-         PositionGetInteger(POSITION_MAGIC) == g_ActiveMagic &&
-         PositionGetString(POSITION_SYMBOL) == _Symbol &&
+         IsManagedPosition() &&
          PositionGetInteger(POSITION_TYPE)  == type)
          count++;
      }
@@ -2160,8 +2559,7 @@ int CountBuyGridSteps()
      {
       ulong t = OrderGetTicket(i);
       if(!OrderSelect(t)) continue;
-      if(OrderGetInteger(ORDER_MAGIC) != g_ActiveMagic) continue;
-      if(OrderGetString(ORDER_SYMBOL) != _Symbol) continue;
+      if(!IsManagedOrder()) continue;
       ENUM_ORDER_TYPE type = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
       if(type == ORDER_TYPE_BUY_STOP || type == ORDER_TYPE_BUY_LIMIT)
          count++;
@@ -2176,8 +2574,7 @@ int CountSellGridSteps()
      {
       ulong t = OrderGetTicket(i);
       if(!OrderSelect(t)) continue;
-      if(OrderGetInteger(ORDER_MAGIC) != g_ActiveMagic) continue;
-      if(OrderGetString(ORDER_SYMBOL) != _Symbol) continue;
+      if(!IsManagedOrder()) continue;
       ENUM_ORDER_TYPE type = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
       if(type == ORDER_TYPE_SELL_STOP || type == ORDER_TYPE_SELL_LIMIT)
          count++;
@@ -2207,8 +2604,7 @@ void CheckTotalProfitLoss()
      {
       ulong t = PositionGetTicket(i);
       if(PositionSelectByTicket(t) &&
-         PositionGetInteger(POSITION_MAGIC) == g_ActiveMagic &&
-         PositionGetString(POSITION_SYMBOL) == _Symbol)
+         IsManagedPosition())
         {
          openProfit += PositionGetDouble(POSITION_PROFIT);
          posCount++;
@@ -2224,6 +2620,16 @@ void CheckTotalProfitLoss()
         {
          int oldMagic = g_ActiveMagic;
          PrintFormat("🎯 هدف سود/ضرر کلی با سود بسته‌شده برآورده شد: %.2f$ (بدون پوزیشن باز)", totalProfit);
+         WriteGridReport();
+         CloseAll();
+         if(AnyGridExists())
+           {
+            Print("⚠️ CloseAll کامل انجام نشد؛ ریست شبکه انجام نشد (ترید متوقف شد).");
+            tradingDone = true;
+            isTradingActive = false;
+            SaveState();
+            return;
+           }
          g_GridInstance++;
          g_ActiveMagic = MagicNumber + g_GridInstance;
          buyExpansionCount  = 0;
@@ -2237,6 +2643,7 @@ void CheckTotalProfitLoss()
          ClearState();
          SaveState();
          PrintFormat("شبکه با Magic=%d بسته شد. Magic جدید=%d آماده‌ی شروع.", oldMagic, g_ActiveMagic);
+         ScheduleNextGrid();
         }
       return;
      }
@@ -2256,16 +2663,14 @@ void CheckTotalProfitLoss()
         {
          ulong t = PositionGetTicket(i);
          if(PositionSelectByTicket(t) &&
-            PositionGetInteger(POSITION_MAGIC) == oldMagic &&
-            PositionGetString(POSITION_SYMBOL) == _Symbol)
+            IsManagedPosition())
             posLeft++;
         }
       for(int i = OrdersTotal() - 1; i >= 0; i--)
         {
          ulong t = OrderGetTicket(i);
          if(OrderSelect(t) &&
-            OrderGetInteger(ORDER_MAGIC) == oldMagic &&
-            OrderGetString(ORDER_SYMBOL) == _Symbol)
+            IsManagedOrder())
             ordLeft++;
         }
       {
@@ -2311,16 +2716,14 @@ void CheckTotalProfitLoss()
         {
          ulong t = PositionGetTicket(i);
          if(PositionSelectByTicket(t) &&
-            PositionGetInteger(POSITION_MAGIC) == oldMagic &&
-            PositionGetString(POSITION_SYMBOL) == _Symbol)
+            IsManagedPosition())
             posLeft++;
         }
       for(int i = OrdersTotal() - 1; i >= 0; i--)
         {
          ulong t = OrderGetTicket(i);
          if(OrderSelect(t) &&
-            OrderGetInteger(ORDER_MAGIC) == oldMagic &&
-            OrderGetString(ORDER_SYMBOL) == _Symbol)
+            IsManagedOrder())
             ordLeft++;
         }
       {
@@ -2352,7 +2755,8 @@ void CheckTotalProfitLoss()
       ScheduleNextGrid();
      }
 
-   ResetTrailingState();
+   if(!isTradingActive || tradingDone)
+      ResetTrailingState();
   }
 
 void CheckBasketTrailingStop()
@@ -2513,16 +2917,14 @@ void CloseAll()
      {
       ulong t = PositionGetTicket(i);
       if(PositionSelectByTicket(t) &&
-         PositionGetInteger(POSITION_MAGIC) == g_ActiveMagic &&
-         PositionGetString(POSITION_SYMBOL) == _Symbol)
+         IsManagedPosition())
          posCount++;
      }
    for(int i = OrdersTotal() - 1; i >= 0; i--)
      {
       ulong t = OrderGetTicket(i);
       if(OrderSelect(t) &&
-         OrderGetInteger(ORDER_MAGIC) == g_ActiveMagic &&
-         OrderGetString(ORDER_SYMBOL) == _Symbol)
+         IsManagedOrder())
          ordCount++;
      }
 
@@ -2547,8 +2949,7 @@ void ClosePositionsNearestFirst(double currentPrice, bool &anyClosed)
    {
       ulong t = PositionGetTicket(i);
       if(PositionSelectByTicket(t) &&
-         PositionGetInteger(POSITION_MAGIC) == g_ActiveMagic &&
-         PositionGetString(POSITION_SYMBOL) == _Symbol)
+         IsManagedPosition())
       {
          double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
          ArrayResize(distances, count + 1);
@@ -2630,8 +3031,7 @@ void ClosePositionsNearestFirstBlocking(double currentPrice, bool &anyClosed)
    {
       ulong t = PositionGetTicket(i);
       if(PositionSelectByTicket(t) &&
-         PositionGetInteger(POSITION_MAGIC) == g_ActiveMagic &&
-         PositionGetString(POSITION_SYMBOL) == _Symbol)
+         IsManagedPosition())
       {
          double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
          ArrayResize(distances, count + 1);
@@ -2705,8 +3105,7 @@ void DeleteOrdersNearestFirst(double currentPrice, bool &anyClosed)
    {
       ulong t = OrderGetTicket(i);
       if(OrderSelect(t) &&
-         OrderGetInteger(ORDER_MAGIC) == g_ActiveMagic &&
-         OrderGetString(ORDER_SYMBOL) == _Symbol)
+         IsManagedOrder())
       {
          double price = OrderGetDouble(ORDER_PRICE_OPEN);
          ArrayResize(distances, count + 1);
@@ -2763,8 +3162,7 @@ void CloseProfitableGrid()
      {
       ulong t = PositionGetTicket(i);
       if(PositionSelectByTicket(t) &&
-         PositionGetInteger(POSITION_MAGIC) == g_ActiveMagic &&
-         PositionGetString(POSITION_SYMBOL) == _Symbol &&
+         IsManagedPosition() &&
          PositionGetDouble(POSITION_PROFIT) > 0)
          if(GridTrade.PositionClose(t)) closed++;
      }
@@ -2845,8 +3243,7 @@ double CalculateTotalProfit()
      {
       ulong t = PositionGetTicket(i);
       if(PositionSelectByTicket(t) &&
-         PositionGetInteger(POSITION_MAGIC) == g_ActiveMagic &&
-         PositionGetString(POSITION_SYMBOL) == _Symbol)
+         IsManagedPosition())
          totalProfit += PositionGetDouble(POSITION_PROFIT);
      }
    return totalProfit;
@@ -2856,7 +3253,8 @@ double CalculateTotalProfit()
 double CalculateClosedGridProfit()
   {
    double closedProfit = 0.0;
-   if(!HistorySelect(0, TimeCurrent()))
+   datetime from = (g_AdoptionActive && g_AdoptionTime > 0) ? g_AdoptionTime : 0;
+   if(!HistorySelect(from, TimeCurrent()))
       return 0.0;
 
    int totalDeals = HistoryDealsTotal();
@@ -2864,22 +3262,20 @@ double CalculateClosedGridProfit()
      {
       ulong dealTicket = HistoryDealGetTicket(i);
       if(dealTicket == 0) continue;
-      if(HistoryDealGetInteger(dealTicket, DEAL_MAGIC) != g_ActiveMagic) continue;
       if(HistoryDealGetString(dealTicket, DEAL_SYMBOL) != _Symbol) continue;
-
-      long dealType = HistoryDealGetInteger(dealTicket, DEAL_TYPE);
-      if(dealType != DEAL_TYPE_BUY && dealType != DEAL_TYPE_SELL) continue;
-
-      long entryType = HistoryDealGetInteger(dealTicket, DEAL_ENTRY);
-      if(entryType != DEAL_ENTRY_OUT &&
-         entryType != DEAL_ENTRY_INOUT &&
-         entryType != DEAL_ENTRY_OUT_BY)
+      if(!IsClosingDeal(dealTicket)) continue;
+      if(g_AdoptionActive &&
+         (datetime)HistoryDealGetInteger(dealTicket, DEAL_TIME) < g_AdoptionTime)
          continue;
 
-      closedProfit += HistoryDealGetDouble(dealTicket, DEAL_PROFIT);
-      closedProfit += HistoryDealGetDouble(dealTicket, DEAL_SWAP);
-      closedProfit += HistoryDealGetDouble(dealTicket, DEAL_COMMISSION);
-      closedProfit += HistoryDealGetDouble(dealTicket, DEAL_FEE);
+      long magic = HistoryDealGetInteger(dealTicket, DEAL_MAGIC);
+      ulong positionId = (ulong)HistoryDealGetInteger(dealTicket, DEAL_POSITION_ID);
+      bool belongs = (magic == g_ActiveMagic);
+      if(g_AdoptionActive && !belongs)
+         belongs = IdInList(g_AdoptedPositionIds, positionId);
+      if(!belongs) continue;
+
+      closedProfit += DealMoney(dealTicket);
      }
 
    return closedProfit;
@@ -2939,32 +3335,30 @@ void UpdateChartComment()
 
    if(!isTradingActive)
      {
-      commentText = "═════ GridHedge Ultimate ═════\n"
-              "🏷️ نسخه: " + eaVersion + "\n"
+      commentText = "🏷️ نسخه: " + eaVersion + "\n"
               "🔴 شبکه غیرفعال است.\n"
-              "برای شروع، دکمه «شروع شبکه» را بزنید.\n\n";
+              "برای شروع، دکمه «شروع شبکه» را بزنید.\n"
+              "اگر معاملات قبلی بی‌صاحب مانده‌اند، دکمه «پذیرش معاملات» را بزنید.\n\n";
       commentText += GetLotDisplayText();
       commentText += "🧭 روند کوتاه " + TrendTimeframeText(ShortTrendTF) + " : " + shortTrendStr + "\n";
       commentText += "🧭 روند میانی " + TrendTimeframeText(MidTrendTF) + " : " + midTrendStr + "\n";
-      string timerStatus = g_EnableStartTimer ? "فعال" : "غیرفعال";
-      commentText += "⏲️ تایمر شروع: " + timerStatus + " (" + StringFormat("%02d:%02d", StartTimerHour, StartTimerMinute) + ")\n";
+      commentText += StartTimerStatusText();
       commentText += ConsecutiveGridStatusText();
-      Comment(commentText);
+      ShowInfoPanel(commentText);
       return;
      }
    if(tradingDone)
      {
-      commentText = "═════ GridHedge Ultimate ═════\n"
-              "🏷️ نسخه: " + eaVersion + "\n"
+      commentText = "🏷️ نسخه: " + eaVersion + "\n"
               "✅ شبکه پایان یافته (هدف سود یا حد ضرر رسیده).\n"
-              "برای شروع مجدد، دکمه «شروع شبکه» را بزنید.\n\n";
+              "برای شروع مجدد، دکمه «شروع شبکه» را بزنید.\n"
+              "اگر معاملات قبلی بی‌صاحب مانده‌اند، دکمه «پذیرش معاملات» را بزنید.\n\n";
       commentText += GetLotDisplayText();
       commentText += "🧭 روند کوتاه " + TrendTimeframeText(ShortTrendTF) + " : " + shortTrendStr + "\n";
       commentText += "🧭 روند میانی " + TrendTimeframeText(MidTrendTF) + " : " + midTrendStr + "\n";
-      string timerStatus = g_EnableStartTimer ? "فعال" : "غیرفعال";
-      commentText += "⏲️ تایمر شروع: " + timerStatus + " (" + StringFormat("%02d:%02d", StartTimerHour, StartTimerMinute) + ")\n";
+      commentText += StartTimerStatusText();
       commentText += ConsecutiveGridStatusText();
-      Comment(commentText);
+      ShowInfoPanel(commentText);
       return;
      }
 
@@ -2978,8 +3372,7 @@ void UpdateChartComment()
      {
       ulong t = PositionGetTicket(i);
       if(PositionSelectByTicket(t) &&
-         PositionGetInteger(POSITION_MAGIC) == g_ActiveMagic &&
-         PositionGetString(POSITION_SYMBOL) == _Symbol)
+         IsManagedPosition())
         {
          totalProfit += PositionGetDouble(POSITION_PROFIT);
          totalPos++;
@@ -2994,8 +3387,7 @@ void UpdateChartComment()
      {
       ulong t = OrderGetTicket(i);
       if(OrderSelect(t) &&
-         OrderGetInteger(ORDER_MAGIC) == g_ActiveMagic &&
-         OrderGetString(ORDER_SYMBOL) == _Symbol)
+         IsManagedOrder())
         {
          ENUM_ORDER_TYPE type = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
          if(type == ORDER_TYPE_BUY_STOP || type == ORDER_TYPE_BUY_LIMIT)
@@ -3005,10 +3397,11 @@ void UpdateChartComment()
         }
      }
 
-   commentText += "═══════ GridHedge Ultimate ═══════\n";
    commentText += "🏷️ نسخه : " + eaVersion + "\n";
    commentText += "🔢 Magic   : " + IntegerToString(g_ActiveMagic) + "\n";
    commentText += "🏷️ شناسه   : " + g_GridID + "\n";
+   if(g_AdoptionActive)
+      commentText += "📥 حالت پذیرش: معاملات موجود به‌عنوان این شبکه مدیریت می‌شوند\n";
    commentText += "🧭 جهت شبکه: " + directionStr + "\n";
    commentText += "🧭 روند کوتاه " + TrendTimeframeText(ShortTrendTF) + " : " + shortTrendStr + "\n";
    commentText += "🧭 روند میانی " + TrendTimeframeText(MidTrendTF) + " : " + midTrendStr + "\n";
@@ -3030,11 +3423,127 @@ void UpdateChartComment()
                      DoubleToString(g_MaxFloatingPL, 2) + " $  (اوج)\n";
      }
    commentText += "🎯 هدف سود : " + DoubleToString(TotalProfitTarget, 2) + " $   |   حد ضرر: " + DoubleToString(TotalStopLoss, 2) + " $\n";
-    commentText += "⏲️ تایمر شروع: " + (g_EnableStartTimer ? "فعال" : "غیرفعال") + " (" + StringFormat("%02d:%02d", StartTimerHour, StartTimerMinute) + ")\n";
+    commentText += StartTimerStatusText();
     commentText += ConsecutiveGridStatusText();
    commentText += "⚙️ وضعیت   : " + (isTradingActive ? "فعال" : "غیرفعال") + " | " + (tradingDone ? "پایان یافته" : "در حال اجرا");
 
-   Comment(commentText);
+   ShowInfoPanel(commentText);
+  }
+
+//+------------------------------------------------------------------+
+//| پنل اطلاعات: کادر رنگی پایین-راست چارت به‌جای Comment            |
+//+------------------------------------------------------------------+
+#define INFO_PANEL_PREFIX "InfoPanel_"
+const string InfoPanelFont     = "Segoe UI";
+const int    InfoPanelFontSize = 8;
+const int    InfoPanelLineH    = 15;
+const int    InfoPanelPadX     = 8;
+const int    InfoPanelPadY     = 6;
+const int    InfoPanelMarginX  = 4;
+const int    InfoPanelMarginY  = 4;
+const color  InfoPanelBg       = C'18,22,30';
+const color  InfoPanelBorder   = C'70,80,100';
+const color  InfoPanelText     = clrWhite;
+const bool   InfoPanelRTL      = true;
+
+// RLE ... PDF: جهت پاراگراف را راست‌به‌چپ می‌کند تا آیکن سمت راست عنوان بیاید
+string InfoPanelLine(string s)
+  {
+   if(!InfoPanelRTL || s == "") return s;
+   return ShortToString(0x202B) + s + ShortToString(0x202C);
+  }
+
+string g_InfoPanelLastText = "";
+int    g_InfoPanelLineCount = 0;
+
+void DeleteInfoPanel()
+  {
+   ObjectsDeleteAll(0, INFO_PANEL_PREFIX);
+   g_InfoPanelLastText = "";
+   g_InfoPanelLineCount = 0;
+  }
+
+void ShowInfoPanel(string text)
+  {
+   string bgName = INFO_PANEL_PREFIX + "Bg";
+   if(text == g_InfoPanelLastText && ObjectFind(0, bgName) >= 0)
+      return;
+
+   string raw[];
+   int rawCount = StringSplit(text, '\n', raw);
+   string lines[];
+   int n = 0;
+   for(int i = 0; i < rawCount; i++)
+     {
+      string s = raw[i];
+      StringTrimRight(s);
+      if(s == "" && (n == 0 || lines[n - 1] == "")) continue;
+      ArrayResize(lines, n + 1);
+      lines[n++] = InfoPanelLine(s);
+     }
+   while(n > 0 && lines[n - 1] == "") { n--; ArrayResize(lines, n); }
+   if(n == 0) { DeleteInfoPanel(); return; }
+
+   TextSetFont(InfoPanelFont, -InfoPanelFontSize * 10);
+   int maxW = 0;
+   for(int i = 0; i < n; i++)
+     {
+      uint w = 0, h = 0;
+      if(lines[i] != "" && TextGetSize(lines[i], w, h) && (int)w > maxW)
+         maxW = (int)w;
+     }
+
+   int width  = maxW + 2 * InfoPanelPadX + 8;
+   int height = n * InfoPanelLineH + 2 * InfoPanelPadY;
+
+   // اگر کادر حذف شده باشد، خطوط هم از نو ساخته شوند تا زیر کادر نیفتند
+   if(ObjectFind(0, bgName) < 0)
+     {
+      ObjectsDeleteAll(0, INFO_PANEL_PREFIX);
+      g_InfoPanelLineCount = 0;
+      ObjectCreate(0, bgName, OBJ_RECTANGLE_LABEL, 0, 0, 0);
+      ObjectSetInteger(0, bgName, OBJPROP_CORNER,      CORNER_RIGHT_LOWER);
+      ObjectSetInteger(0, bgName, OBJPROP_BORDER_TYPE, BORDER_FLAT);
+      ObjectSetInteger(0, bgName, OBJPROP_BGCOLOR,     InfoPanelBg);
+      ObjectSetInteger(0, bgName, OBJPROP_COLOR,       InfoPanelBorder);
+      ObjectSetInteger(0, bgName, OBJPROP_WIDTH,       1);
+      ObjectSetInteger(0, bgName, OBJPROP_BACK,        false);
+      ObjectSetInteger(0, bgName, OBJPROP_SELECTABLE,  false);
+      ObjectSetInteger(0, bgName, OBJPROP_HIDDEN,      true);
+      Comment("");
+     }
+   ObjectSetInteger(0, bgName, OBJPROP_XDISTANCE, width + InfoPanelMarginX);
+   ObjectSetInteger(0, bgName, OBJPROP_YDISTANCE, height + InfoPanelMarginY);
+   ObjectSetInteger(0, bgName, OBJPROP_XSIZE,     width);
+   ObjectSetInteger(0, bgName, OBJPROP_YSIZE,     height);
+
+   for(int i = 0; i < n; i++)
+     {
+      string name = INFO_PANEL_PREFIX + IntegerToString(i);
+      if(ObjectFind(0, name) < 0)
+        {
+         ObjectCreate(0, name, OBJ_LABEL, 0, 0, 0);
+         ObjectSetInteger(0, name, OBJPROP_CORNER,     CORNER_RIGHT_LOWER);
+         ObjectSetInteger(0, name, OBJPROP_ANCHOR,     ANCHOR_RIGHT_UPPER);
+         ObjectSetString (0, name, OBJPROP_FONT,       InfoPanelFont);
+         ObjectSetInteger(0, name, OBJPROP_FONTSIZE,   InfoPanelFontSize);
+         ObjectSetInteger(0, name, OBJPROP_BACK,       false);
+         ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+         ObjectSetInteger(0, name, OBJPROP_HIDDEN,     true);
+        }
+      ObjectSetInteger(0, name, OBJPROP_XDISTANCE, InfoPanelMarginX + InfoPanelPadX);
+      ObjectSetInteger(0, name, OBJPROP_YDISTANCE,
+                       InfoPanelMarginY + height - InfoPanelPadY - i * InfoPanelLineH);
+      ObjectSetInteger(0, name, OBJPROP_COLOR, InfoPanelText);
+      ObjectSetString (0, name, OBJPROP_TEXT, (lines[i] == "") ? " " : lines[i]);
+     }
+
+   for(int i = n; i < g_InfoPanelLineCount; i++)
+      ObjectDelete(0, INFO_PANEL_PREFIX + IntegerToString(i));
+   g_InfoPanelLineCount = n;
+
+   g_InfoPanelLastText = text;
+   ChartRedraw(0);
   }
 
   void WriteGridReport()
@@ -3052,8 +3561,7 @@ void UpdateChartComment()
      {
       ulong t = OrderGetTicket(i);
       if(OrderSelect(t) &&
-         OrderGetInteger(ORDER_MAGIC) == g_ActiveMagic &&
-         OrderGetString(ORDER_SYMBOL) == _Symbol)
+         IsManagedOrder())
         {
          ENUM_ORDER_TYPE type = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
          if(type == ORDER_TYPE_BUY_STOP || type == ORDER_TYPE_BUY_LIMIT) buyOrders++;
@@ -3089,7 +3597,7 @@ void UpdateChartComment()
       report += "📊 کران سود: " + DoubleToString(g_MinFloatingPL, 2) + " $ (کف) | " +
                 DoubleToString(g_MaxFloatingPL, 2) + " $ (اوج)\n";
 
-   report += "⏲️ تایمر شروع: " + (g_EnableStartTimer ? "فعال" : "غیرفعال") + " (" +
+   report += "⏲️ تایمر شروع: " + (EnableStartTimer ? "فعال" : "غیرفعال") + " (" +
              StringFormat("%02d:%02d", StartTimerHour, StartTimerMinute) + ")\n";
    report += "⚙️ وضعیت: پایان یافته\n";
    report += "═════════════════════════════════════════════\n";
@@ -3175,8 +3683,7 @@ double EstimateTrailingActivationPrice(double targetProfit)
      {
       ulong t = PositionGetTicket(i);
       if(PositionSelectByTicket(t) &&
-         PositionGetInteger(POSITION_MAGIC) == g_ActiveMagic &&
-         PositionGetString(POSITION_SYMBOL) == _Symbol)
+         IsManagedPosition())
         {
          double vol = PositionGetDouble(POSITION_VOLUME); // lots
          long   ptype = PositionGetInteger(POSITION_TYPE);
@@ -3243,6 +3750,14 @@ void CreateStartButton()
   }
 
 //+------------------------------------------------------------------+
+//| دکمه پذیرش معاملات باز فعلی به‌عنوان شبکه                        |
+//+------------------------------------------------------------------+
+void CreateAdoptButton()
+  {
+   CreateButton("BtnAdoptTrades", "پذیرش معاملات", 544, 33, 100, 24, clrWhite, clrDarkSlateBlue, 8);
+  }
+
+//+------------------------------------------------------------------+
 //| دکمه‌های بستن (کوچک‌تر)                                        |
 //+------------------------------------------------------------------+
 void CreateCloseButtons()
@@ -3279,22 +3794,6 @@ void CreateCloseButtons()
       ObjectSetInteger(0, n2, OBJPROP_BORDER_COLOR, clrBlack);
       ObjectSetInteger(0, n2, OBJPROP_FONTSIZE,     8);
       ObjectSetInteger(0, n2, OBJPROP_SELECTABLE,   false);
-     }
-
-   if(ShowStartTimerButton)
-     {
-      CreateButton("BtnToggleStartTimer", "تایمر شروع", 130, 250, 120, 24, clrWhite, clrDodgerBlue, 8);
-      if(ObjectFind(0, "ValStartTimer") < 0)
-        {
-         ObjectCreate(0, "ValStartTimer", OBJ_LABEL, 0, 0, 0);
-         ObjectSetInteger(0, "ValStartTimer", OBJPROP_CORNER,    CORNER_RIGHT_UPPER);
-         ObjectSetInteger(0, "ValStartTimer", OBJPROP_XDISTANCE, 280);
-         ObjectSetInteger(0, "ValStartTimer", OBJPROP_YDISTANCE, 250);
-         ObjectSetString (0, "ValStartTimer", OBJPROP_TEXT,      "");
-         ObjectSetInteger(0, "ValStartTimer", OBJPROP_COLOR,     clrYellow);
-         ObjectSetInteger(0, "ValStartTimer", OBJPROP_FONTSIZE,  8);
-         ObjectSetInteger(0, "ValStartTimer", OBJPROP_SELECTABLE, false);
-        }
      }
 
    string n3 = "BtnFinishGrid";
@@ -3371,36 +3870,36 @@ void CreateLotButtons()
    // برچسب "Lot:"
    ObjectCreate(0, "LblLot", OBJ_LABEL, 0, 0, 0);
    ObjectSetInteger(0, "LblLot", OBJPROP_CORNER,    CORNER_RIGHT_UPPER);
-   ObjectSetInteger(0, "LblLot", OBJPROP_XDISTANCE, 258);
-   ObjectSetInteger(0, "LblLot", OBJPROP_YDISTANCE, 127);
+   ObjectSetInteger(0, "LblLot", OBJPROP_XDISTANCE, 440);
+   ObjectSetInteger(0, "LblLot", OBJPROP_YDISTANCE, 65);
    ObjectSetString (0, "LblLot", OBJPROP_TEXT,      "Lot:");
    ObjectSetInteger(0, "LblLot", OBJPROP_COLOR,     clrGreenYellow);
    ObjectSetInteger(0, "LblLot", OBJPROP_FONTSIZE,  8);
 
    // دکمه کاهش
-   CreateButton("BtnLotMinus", "-", 218, 127, 20, 20, clrBlack, clrGreenYellow, 8);
+   CreateButton("BtnLotMinus", "-", 400, 70, 20, 20, clrBlack, clrGreenYellow, 8);
 
    // مقدار فعلی
    ObjectCreate(0, "ValLot", OBJ_LABEL, 0, 0, 0);
    ObjectSetInteger(0, "ValLot", OBJPROP_CORNER,    CORNER_RIGHT_UPPER);
-   ObjectSetInteger(0, "ValLot", OBJPROP_XDISTANCE, 190);
-   ObjectSetInteger(0, "ValLot", OBJPROP_YDISTANCE, 127);
+   ObjectSetInteger(0, "ValLot", OBJPROP_XDISTANCE, 372);
+   ObjectSetInteger(0, "ValLot", OBJPROP_YDISTANCE, 65);
    ObjectSetString (0, "ValLot", OBJPROP_TEXT,      DoubleToString(g_CurrentLot, 3));
    ObjectSetInteger(0, "ValLot", OBJPROP_COLOR,     clrGreenYellow);
    ObjectSetInteger(0, "ValLot", OBJPROP_FONTSIZE,  8);
 
    // دکمه افزایش
-   CreateButton("BtnLotPlus",  "+", 126, 127, 20, 20, clrBlueViolet, clrGreenYellow, 8);
+   CreateButton("BtnLotPlus",  "+", 308, 70, 20, 20, clrBlueViolet, clrGreenYellow, 8);
 
    // دکمه تغییر وضعیت Camarilla
    if(ShowCamarillaButtons)
      {
-      CreateButton("BtnToggleCamarilla", "حمایت/مقاومت", 126, 151, 120, 20, clrWhite, clrDodgerBlue, 8);
+      CreateButton("BtnToggleCamarilla", "حمایت/مقاومت", 126, 127, 120, 20, clrWhite, clrDodgerBlue, 8);
 
       ObjectCreate(0, "ValCamarilla", OBJ_LABEL, 0, 0, 0);
       ObjectSetInteger(0, "ValCamarilla", OBJPROP_CORNER,    CORNER_RIGHT_UPPER);
       ObjectSetInteger(0, "ValCamarilla", OBJPROP_XDISTANCE, 178);
-      ObjectSetInteger(0, "ValCamarilla", OBJPROP_YDISTANCE, 151);
+      ObjectSetInteger(0, "ValCamarilla", OBJPROP_YDISTANCE, 127);
       ObjectSetString (0, "ValCamarilla", OBJPROP_TEXT,      g_EnableCamarillaCheck ? "true" : "false");
       ObjectSetInteger(0, "ValCamarilla", OBJPROP_COLOR,     clrYellow);
       ObjectSetInteger(0, "ValCamarilla", OBJPROP_FONTSIZE,  8);
@@ -3409,23 +3908,23 @@ void CreateLotButtons()
       if(!EnableCamarillaCheck)
         {
          // دکمه تغییر وضعیت محدودیت بازه کاماریلا
-         CreateButton("BtnToggleCamarillaRange", "حالت بازه", 126, 175, 120, 20, clrWhite, clrMediumPurple, 8);
+         CreateButton("BtnToggleCamarillaRange", "حالت بازه", 126, 151, 120, 20, clrWhite, clrMediumPurple, 8);
 
          ObjectCreate(0, "ValCamarillaRange", OBJ_LABEL, 0, 0, 0);
          ObjectSetInteger(0, "ValCamarillaRange", OBJPROP_CORNER,    CORNER_RIGHT_UPPER);
          ObjectSetInteger(0, "ValCamarillaRange", OBJPROP_XDISTANCE, 178);
-         ObjectSetInteger(0, "ValCamarillaRange", OBJPROP_YDISTANCE, 175);
+         ObjectSetInteger(0, "ValCamarillaRange", OBJPROP_YDISTANCE, 151);
          ObjectSetString (0, "ValCamarillaRange", OBJPROP_TEXT,      "H2-L2");
          ObjectSetInteger(0, "ValCamarillaRange", OBJPROP_COLOR,     clrYellow);
          ObjectSetInteger(0, "ValCamarillaRange", OBJPROP_FONTSIZE,  8);
 
          // دکمه فعال/غیرفعال کردن ویژگی Range Check
-         CreateButton("BtnEnableCamarillaRange", "✓ Range", 126, 199, 120, 20, clrWhite, clrDarkGreen, 8);
+         CreateButton("BtnEnableCamarillaRange", "✓ Range", 126, 175, 120, 20, clrWhite, clrDarkGreen, 8);
 
          ObjectCreate(0, "ValRangeEnabled", OBJ_LABEL, 0, 0, 0);
          ObjectSetInteger(0, "ValRangeEnabled", OBJPROP_CORNER,    CORNER_RIGHT_UPPER);
          ObjectSetInteger(0, "ValRangeEnabled", OBJPROP_XDISTANCE, 178);
-         ObjectSetInteger(0, "ValRangeEnabled", OBJPROP_YDISTANCE, 199);
+         ObjectSetInteger(0, "ValRangeEnabled", OBJPROP_YDISTANCE, 175);
          ObjectSetString (0, "ValRangeEnabled", OBJPROP_TEXT,      g_EnableCamarillaRangeCheck ? "ON" : "OFF");
          ObjectSetInteger(0, "ValRangeEnabled", OBJPROP_COLOR,     g_EnableCamarillaRangeCheck ? clrLime : clrRed);
          ObjectSetInteger(0, "ValRangeEnabled", OBJPROP_FONTSIZE,  8);
@@ -3436,25 +3935,25 @@ void CreateLotButtons()
    if(UseBasketTrailing)
      {
       // دکمه کاهش TrailingActivation
-      CreateButton("BtnTrailingActivationMinus", "-", 218, 223, 20, 20, clrBlack, clrDarkOrange, 8);
+      CreateButton("BtnTrailingActivationMinus", "-", 218, 199, 20, 20, clrBlack, clrDarkOrange, 8);
 
       // مقدار فعلی TrailingActivation
       ObjectCreate(0, "ValTrailingActivation", OBJ_LABEL, 0, 0, 0);
       ObjectSetInteger(0, "ValTrailingActivation", OBJPROP_CORNER,    CORNER_RIGHT_UPPER);
       ObjectSetInteger(0, "ValTrailingActivation", OBJPROP_XDISTANCE, 190);
-      ObjectSetInteger(0, "ValTrailingActivation", OBJPROP_YDISTANCE, 223);
+      ObjectSetInteger(0, "ValTrailingActivation", OBJPROP_YDISTANCE, 199);
       ObjectSetString (0, "ValTrailingActivation", OBJPROP_TEXT,      DoubleToString(g_TrailingActivation, 2));
       ObjectSetInteger(0, "ValTrailingActivation", OBJPROP_COLOR,     clrDarkOrange);
       ObjectSetInteger(0, "ValTrailingActivation", OBJPROP_FONTSIZE,  8);
 
       // دکمه افزایش TrailingActivation
-      CreateButton("BtnTrailingActivationPlus",  "+", 126, 223, 20, 20, clrBlueViolet, clrDarkOrange, 8);
+      CreateButton("BtnTrailingActivationPlus",  "+", 126, 199, 20, 20, clrBlueViolet, clrDarkOrange, 8);
       
       // برچسب TrailingActivation
       ObjectCreate(0, "LblTrailingActivation", OBJ_LABEL, 0, 0, 0);
       ObjectSetInteger(0, "LblTrailingActivation", OBJPROP_CORNER,    CORNER_RIGHT_UPPER);
       ObjectSetInteger(0, "LblTrailingActivation", OBJPROP_XDISTANCE, 500);
-      ObjectSetInteger(0, "LblTrailingActivation", OBJPROP_YDISTANCE, 223);
+      ObjectSetInteger(0, "LblTrailingActivation", OBJPROP_YDISTANCE, 199);
       ObjectSetString (0, "LblTrailingActivation", OBJPROP_TEXT,      "Trailing:");
       ObjectSetInteger(0, "LblTrailingActivation", OBJPROP_COLOR,     clrDarkOrange);
       ObjectSetInteger(0, "LblTrailingActivation", OBJPROP_FONTSIZE,  8);
